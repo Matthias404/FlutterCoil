@@ -86,6 +86,9 @@ void main() {
 
       await alpha.updateLobbyRules(
         const LobbyRules(
+          gameType: GameType.time,
+          magazineSize: 15,
+          reloadTimeSeconds: 3,
           maxLives: 15,
           matchLengthMinutes: 12,
           maxPlayers: 10,
@@ -99,6 +102,8 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
       expect(bravo.snapshot.lobbyRules.maxLives, 15);
+      expect(bravo.snapshot.lobbyRules.magazineSize, 15);
+      expect(bravo.snapshot.lobbyRules.reloadTimeSeconds, 3);
       expect(bravo.snapshot.lobbyRules.matchLengthMinutes, 12);
       expect(bravo.snapshot.lobbyRules.friendlyFire, isTrue);
       expect(bravo.snapshot.lobbyRules.teamLeadVoiceOnly, isTrue);

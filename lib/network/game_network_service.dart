@@ -12,6 +12,8 @@ enum GamePhase { setup, running, ended }
 
 enum RespawnMode { onDeath, atTeamBase }
 
+enum GameType { time, lives, teamLives, kingOfTheHill, freeForAll }
+
 RespawnMode _respawnModeFromString(String value) {
   return RespawnMode.values.firstWhere(
     (mode) => mode.name == value,
@@ -26,8 +28,58 @@ GamePhase _phaseFromString(String value) {
   );
 }
 
+GameType _gameTypeFromString(String value) {
+  final normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case 'time':
+      return GameType.time;
+    case 'lives':
+      return GameType.lives;
+    case 'teamlives':
+    case 'team_lives':
+    case 'team lives':
+      return GameType.teamLives;
+    // backward-compat aliases
+    case 'timelife':
+    case 'time_life':
+    case 'time life':
+    case 'team battle':
+      return GameType.time;
+    case 'kingofthehill':
+    case 'king_of_the_hill':
+    case 'king of the hill':
+      return GameType.kingOfTheHill;
+    case 'freeforall':
+    case 'free_for_all':
+    case 'free for all':
+      return GameType.freeForAll;
+    default:
+      return GameType.time;
+  }
+}
+
+extension GameTypeLabel on GameType {
+  String get label {
+    switch (this) {
+      case GameType.time:
+        return 'Time';
+      case GameType.lives:
+        return 'Lives';
+      case GameType.teamLives:
+        return 'Team Lives';
+      case GameType.kingOfTheHill:
+        return 'King of the Hill';
+      case GameType.freeForAll:
+        return 'Free for All';
+    }
+  }
+}
+
 class LobbyRules {
   const LobbyRules({
+    required this.gameType,
+    this.magazineSize = 15,
+    this.reloadTimeSeconds = 2,
     required this.maxLives,
     required this.matchLengthMinutes,
     required this.maxPlayers,
@@ -35,6 +87,7 @@ class LobbyRules {
     required this.itemSpawnRateSeconds,
     this.respawnMode = RespawnMode.onDeath,
     this.baseRadiusMeters = 2.0,
+    this.hillRadiusMeters = 2.0,
     required this.friendlyFire,
     required this.allowMidGameJoin,
     required this.teamLeadVoiceOnly,
@@ -42,18 +95,25 @@ class LobbyRules {
   });
 
   const LobbyRules.defaults()
-    : maxLives = 10,
+    : gameType = GameType.time,
+      magazineSize = 15,
+      reloadTimeSeconds = 2,
+      maxLives = 10,
       matchLengthMinutes = 10,
       maxPlayers = 8,
       respawnDelaySeconds = 3,
       itemSpawnRateSeconds = 30,
       respawnMode = RespawnMode.onDeath,
       baseRadiusMeters = 2.0,
+      hillRadiusMeters = 2.0,
       friendlyFire = false,
       allowMidGameJoin = true,
       teamLeadVoiceOnly = true,
       showOtherPlayersOnMap = true;
 
+  final GameType gameType;
+  final int magazineSize;
+  final int reloadTimeSeconds;
   final int maxLives;
   final int matchLengthMinutes;
   final int maxPlayers;
@@ -61,12 +121,16 @@ class LobbyRules {
   final int itemSpawnRateSeconds;
   final RespawnMode respawnMode;
   final double baseRadiusMeters;
+  final double hillRadiusMeters;
   final bool friendlyFire;
   final bool allowMidGameJoin;
   final bool teamLeadVoiceOnly;
   final bool showOtherPlayersOnMap;
 
   LobbyRules copyWith({
+    GameType? gameType,
+    int? magazineSize,
+    int? reloadTimeSeconds,
     int? maxLives,
     int? matchLengthMinutes,
     int? maxPlayers,
@@ -74,12 +138,16 @@ class LobbyRules {
     int? itemSpawnRateSeconds,
     RespawnMode? respawnMode,
     double? baseRadiusMeters,
+    double? hillRadiusMeters,
     bool? friendlyFire,
     bool? allowMidGameJoin,
     bool? teamLeadVoiceOnly,
     bool? showOtherPlayersOnMap,
   }) {
     return LobbyRules(
+      gameType: gameType ?? this.gameType,
+      magazineSize: magazineSize ?? this.magazineSize,
+      reloadTimeSeconds: reloadTimeSeconds ?? this.reloadTimeSeconds,
       maxLives: maxLives ?? this.maxLives,
       matchLengthMinutes: matchLengthMinutes ?? this.matchLengthMinutes,
       maxPlayers: maxPlayers ?? this.maxPlayers,
@@ -87,6 +155,7 @@ class LobbyRules {
       itemSpawnRateSeconds: itemSpawnRateSeconds ?? this.itemSpawnRateSeconds,
       respawnMode: respawnMode ?? this.respawnMode,
       baseRadiusMeters: baseRadiusMeters ?? this.baseRadiusMeters,
+      hillRadiusMeters: hillRadiusMeters ?? this.hillRadiusMeters,
       friendlyFire: friendlyFire ?? this.friendlyFire,
       allowMidGameJoin: allowMidGameJoin ?? this.allowMidGameJoin,
       teamLeadVoiceOnly: teamLeadVoiceOnly ?? this.teamLeadVoiceOnly,
@@ -97,6 +166,9 @@ class LobbyRules {
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
+      'gameType': gameType.name,
+      'magazineSize': magazineSize,
+      'reloadTimeSeconds': reloadTimeSeconds,
       'maxLives': maxLives,
       'matchLengthMinutes': matchLengthMinutes,
       'maxPlayers': maxPlayers,
@@ -104,6 +176,7 @@ class LobbyRules {
       'itemSpawnRateSeconds': itemSpawnRateSeconds,
       'respawnMode': respawnMode.name,
       'baseRadiusMeters': baseRadiusMeters,
+      'hillRadiusMeters': hillRadiusMeters,
       'friendlyFire': friendlyFire,
       'allowMidGameJoin': allowMidGameJoin,
       'teamLeadVoiceOnly': teamLeadVoiceOnly,
@@ -113,6 +186,9 @@ class LobbyRules {
 
   factory LobbyRules.fromJson(Map<String, dynamic> json) {
     return LobbyRules(
+      gameType: _gameTypeFromString(json['gameType'] as String? ?? ''),
+      magazineSize: json['magazineSize'] as int? ?? 15,
+      reloadTimeSeconds: json['reloadTimeSeconds'] as int? ?? 2,
       maxLives: json['maxLives'] as int? ?? 10,
       matchLengthMinutes: json['matchLengthMinutes'] as int? ?? 10,
       maxPlayers: json['maxPlayers'] as int? ?? 8,
@@ -122,6 +198,7 @@ class LobbyRules {
         json['respawnMode'] as String? ?? RespawnMode.onDeath.name,
       ),
       baseRadiusMeters: (json['baseRadiusMeters'] as num?)?.toDouble() ?? 2.0,
+      hillRadiusMeters: (json['hillRadiusMeters'] as num?)?.toDouble() ?? 2.0,
       friendlyFire: json['friendlyFire'] as bool? ?? false,
       allowMidGameJoin: json['allowMidGameJoin'] as bool? ?? true,
       teamLeadVoiceOnly: json['teamLeadVoiceOnly'] as bool? ?? true,
@@ -271,7 +348,6 @@ class GameNetworkService {
     }
 
     if (isServer) {
-      _assignRandomTeamLeads();
       await _broadcastState();
     }
   }
@@ -307,6 +383,7 @@ class GameNetworkService {
 
     _scheduledStartTriggerTimer?.cancel();
     _scheduledStartTimer?.cancel();
+    _assignRandomTeamLeads();
     _readyTeamLeadIds = <String>{};
     _scheduledGameStartAt = DateTime.now().add(delay);
 
@@ -456,14 +533,12 @@ class GameNetworkService {
           _buildProfilePacket(PacketType.join),
         );
         if (isServer) {
-          _assignRandomTeamLeads();
           _broadcastState();
         }
         break;
       case PacketType.join:
         _upsertPlayer(packet);
         if (isServer) {
-          _assignRandomTeamLeads();
           _broadcastState();
         }
         break;
@@ -516,13 +591,7 @@ class GameNetworkService {
           }
         }
 
-        final messageTeam = packet.payload['group'] as String?;
-        final localTeam = _players[localPlayerId]?.group;
-        if (messageTeam == null ||
-            localTeam == null ||
-            messageTeam != localTeam) {
-          break;
-        }
+        final messageTeam = packet.payload['group'] as String? ?? 'Unknown';
 
         final audioBase64 = packet.payload['audioBase64'] as String? ?? '';
         if (audioBase64.isEmpty) {
@@ -654,11 +723,7 @@ class GameNetworkService {
       if (teamPlayers.isEmpty) {
         continue;
       }
-      final existingLead = teamPlayers
-          .where((player) => player.playerClass == 'Team Lead')
-          .firstOrNull;
-      final leader =
-          existingLead ?? teamPlayers[_random.nextInt(teamPlayers.length)];
+      final leader = teamPlayers[_random.nextInt(teamPlayers.length)];
       for (final player in teamPlayers) {
         _players[player.id] = player.copyWith(
           playerClass: player.id == leader.id ? 'Team Lead' : 'Assult',

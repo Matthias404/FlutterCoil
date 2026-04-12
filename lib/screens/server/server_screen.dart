@@ -20,7 +20,7 @@ class ServerScreen extends StatefulWidget {
   State<ServerScreen> createState() => _ServerScreenState();
 }
 
-enum _GameModePreset { time, life, kingOfTheHill, freeForAll }
+enum _GameModePreset { time, lives, teamLives, kingOfTheHill, freeForAll }
 
 class _ServerScreenState extends State<ServerScreen> {
   static const int _serverPort = 7777;
@@ -39,16 +39,48 @@ class _ServerScreenState extends State<ServerScreen> {
   String _status = 'Starting server...';
   String _networkMode = _lanMode;
   double _maxLives = 10;
+  double _magazineSize = 15;
+  double _reloadTimeSeconds = 2;
   double _matchLength = 10;
-  double _maxPlayers = 8;
   double _respawnDelaySeconds = 3;
   double _itemSpawnRateSeconds = _itemSpawnMinSeconds;
+  double _hillRadiusMeters = 2.0;
   _GameModePreset _selectedPreset = _GameModePreset.time;
   RespawnMode _respawnMode = RespawnMode.onDeath;
   bool _friendlyFire = false;
   bool _allowMidGameJoin = true;
   bool _teamLeadVoiceOnly = true;
   bool _showOtherPlayersOnMap = true;
+
+  GameType _gameTypeForPreset(_GameModePreset preset) {
+    switch (preset) {
+      case _GameModePreset.time:
+        return GameType.time;
+      case _GameModePreset.lives:
+        return GameType.lives;
+      case _GameModePreset.teamLives:
+        return GameType.teamLives;
+      case _GameModePreset.kingOfTheHill:
+        return GameType.kingOfTheHill;
+      case _GameModePreset.freeForAll:
+        return GameType.freeForAll;
+    }
+  }
+
+  _GameModePreset _presetForGameType(GameType gameType) {
+    switch (gameType) {
+      case GameType.time:
+        return _GameModePreset.time;
+      case GameType.lives:
+        return _GameModePreset.lives;
+      case GameType.teamLives:
+        return _GameModePreset.teamLives;
+      case GameType.kingOfTheHill:
+        return _GameModePreset.kingOfTheHill;
+      case GameType.freeForAll:
+        return _GameModePreset.freeForAll;
+    }
+  }
 
   String _formatCountdown(Duration duration) {
     final totalSeconds = duration.inSeconds.clamp(0, 3599);
@@ -103,15 +135,18 @@ class _ServerScreenState extends State<ServerScreen> {
       }
 
       setState(() {
+        _selectedPreset = _presetForGameType(snapshot.lobbyRules.gameType);
         _snapshot = snapshot;
         _maxLives = snapshot.lobbyRules.maxLives.toDouble();
+        _magazineSize = snapshot.lobbyRules.magazineSize.toDouble();
+        _reloadTimeSeconds = snapshot.lobbyRules.reloadTimeSeconds.toDouble();
         _matchLength = snapshot.lobbyRules.matchLengthMinutes.toDouble();
-        _maxPlayers = snapshot.lobbyRules.maxPlayers.toDouble();
         _respawnDelaySeconds = snapshot.lobbyRules.respawnDelaySeconds
             .toDouble();
         _itemSpawnRateSeconds = _normalizeItemSpawnRate(
           snapshot.lobbyRules.itemSpawnRateSeconds.toDouble(),
         );
+        _hillRadiusMeters = snapshot.lobbyRules.hillRadiusMeters;
         _respawnMode = snapshot.lobbyRules.respawnMode;
         _friendlyFire = snapshot.lobbyRules.friendlyFire;
         _allowMidGameJoin = snapshot.lobbyRules.allowMidGameJoin;
@@ -186,51 +221,70 @@ class _ServerScreenState extends State<ServerScreen> {
           _respawnDelaySeconds = 3;
           _itemSpawnRateSeconds = 60;
           _friendlyFire = false;
-        case _GameModePreset.life:
+        case _GameModePreset.lives:
           _matchLength = 10;
           _maxLives = 3;
           _respawnDelaySeconds = 0;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = false;
+        case _GameModePreset.teamLives:
+          _matchLength = 10;
+          _maxLives = 15;
+          _respawnDelaySeconds = 0;
+          _itemSpawnRateSeconds = 45;
+          _friendlyFire = false;
         case _GameModePreset.kingOfTheHill:
           _matchLength = 12;
-          _maxLives = 15;
+          _maxLives = 0;
           _respawnDelaySeconds = 2;
           _itemSpawnRateSeconds = 30;
+          _hillRadiusMeters = 2.0;
           _friendlyFire = false;
         case _GameModePreset.freeForAll:
           _matchLength = 10;
           _maxLives = 8;
           _respawnDelaySeconds = 2;
           _itemSpawnRateSeconds = 45;
-          _friendlyFire = true;
+          _friendlyFire = false;
       }
 
       _itemSpawnRateSeconds = _normalizeItemSpawnRate(_itemSpawnRateSeconds);
-      _status =
-          '${preset == _GameModePreset.time
-              ? 'Time'
-              : preset == _GameModePreset.life
-              ? 'Life'
-              : preset == _GameModePreset.kingOfTheHill
-              ? 'King of the Hill'
-              : 'Free for All'} preset selected. Save rules to apply.';
+      _status = '${_gameModePresetLabel(preset)} preset selected. Save rules to apply.';
     });
+  }
+
+  String _gameModePresetLabel(_GameModePreset preset) {
+    switch (preset) {
+      case _GameModePreset.time:
+        return 'Time';
+      case _GameModePreset.lives:
+        return 'Lives';
+      case _GameModePreset.teamLives:
+        return 'Team Lives';
+      case _GameModePreset.kingOfTheHill:
+        return 'King of the Hill';
+      case _GameModePreset.freeForAll:
+        return 'Free for All';
+    }
   }
 
   Future<void> _applyServerRules() async {
     await _service.updateLocalProfile(name: _serverNameController.text.trim());
     await _service.updateLobbyRules(
       LobbyRules(
+        gameType: _gameTypeForPreset(_selectedPreset),
+        magazineSize: _magazineSize.round(),
+        reloadTimeSeconds: _reloadTimeSeconds.round(),
         maxLives: _maxLives.round(),
         matchLengthMinutes: _matchLength.round(),
-        maxPlayers: _maxPlayers.round(),
+        maxPlayers: _snapshot?.lobbyRules.maxPlayers ?? 8,
         respawnDelaySeconds: _respawnDelaySeconds.round(),
         itemSpawnRateSeconds: _itemSpawnDisabled
             ? _itemSpawnDisabledSeconds.round()
             : _normalizeItemSpawnRate(_itemSpawnRateSeconds).round(),
         respawnMode: _respawnMode,
         baseRadiusMeters: 2.0,
+        hillRadiusMeters: _hillRadiusMeters,
         friendlyFire: _friendlyFire,
         allowMidGameJoin: _allowMidGameJoin,
         teamLeadVoiceOnly: _teamLeadVoiceOnly,
@@ -256,6 +310,45 @@ class _ServerScreenState extends State<ServerScreen> {
       _status =
           'Game start queued. Match starts in 60s or when all Team Leads are ready.';
     });
+  }
+
+  Future<void> _openLobby() async {
+    await _applyServerRules();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _status = 'Lobby is open. Players can now join using the join code.';
+    });
+  }
+
+  Widget _buildModeDescription(_GameModePreset preset) {
+    final String text;
+    switch (preset) {
+      case _GameModePreset.time:
+        text =
+            'Each kill earns a point. The team with the most points when time runs out wins.';
+      case _GameModePreset.lives:
+        text =
+            'Each player has a limited number of lives. No respawn once lives reach zero. The team with the last living player wins. On timeout, the team with the most lives per player wins.';
+      case _GameModePreset.teamLives:
+        text =
+            'All lives are pooled per team. Every player kill reduces the team pool. The last team with lives remaining wins. On timeout, the team with the most lives wins.';
+      case _GameModePreset.kingOfTheHill:
+        text =
+            'Unlimited lives. The hill is placed at the center of all starting GPS positions. Every 3 seconds a team member is inside the hill, that team scores a point. Highest score when time runs out wins.';
+      case _GameModePreset.freeForAll:
+        text =
+            'Every player for themselves — no friendly fire. The player with the most points when time runs out (or the last one alive) wins.';
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Text(
+        text,
+        style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+      ),
+    );
   }
 
   @override
@@ -447,9 +540,15 @@ class _ServerScreenState extends State<ServerScreen> {
                         onSelected: (_) => _applyPreset(_GameModePreset.time),
                       ),
                       ChoiceChip(
-                        label: const Text('Life'),
-                        selected: _selectedPreset == _GameModePreset.life,
-                        onSelected: (_) => _applyPreset(_GameModePreset.life),
+                        label: const Text('Lives'),
+                        selected: _selectedPreset == _GameModePreset.lives,
+                        onSelected: (_) => _applyPreset(_GameModePreset.lives),
+                      ),
+                      ChoiceChip(
+                        label: const Text('Team Lives'),
+                        selected: _selectedPreset == _GameModePreset.teamLives,
+                        onSelected: (_) =>
+                            _applyPreset(_GameModePreset.teamLives),
                       ),
                       ChoiceChip(
                         label: const Text('King of the Hill'),
@@ -466,17 +565,69 @@ class _ServerScreenState extends State<ServerScreen> {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 6),
+                  _buildModeDescription(_selectedPreset),
                   const SizedBox(height: 8),
-                  Text('Max lives: ${_maxLives.round()}'),
+                  if (_selectedPreset != _GameModePreset.kingOfTheHill) ...<Widget>[
+                    Text(
+                      _selectedPreset == _GameModePreset.teamLives
+                          ? 'Team lives pool: ${_maxLives.round()}'
+                          : 'Max lives: ${_maxLives.round()}',
+                    ),
+                    Slider(
+                      value: _maxLives,
+                      min: 1,
+                      max: 20,
+                      divisions: 19,
+                      label: _maxLives.round().toString(),
+                      onChanged: (value) {
+                        setState(() {
+                          _maxLives = value;
+                        });
+                      },
+                    ),
+                  ],
+                  if (_selectedPreset == _GameModePreset.kingOfTheHill) ...<Widget>[
+                    Text(
+                      'Hill radius: ${_hillRadiusMeters.toStringAsFixed(1)} m',
+                    ),
+                    Slider(
+                      value: _hillRadiusMeters,
+                      min: 0.5,
+                      max: 5.0,
+                      divisions: 9,
+                      label: '${_hillRadiusMeters.toStringAsFixed(1)} m',
+                      onChanged: (value) {
+                        setState(() {
+                          _hillRadiusMeters =
+                              (value / 0.5).round() * 0.5;
+                        });
+                      },
+                    ),
+                  ],
+                  Text('Magazine size: ${_magazineSize.round()}'),
                   Slider(
-                    value: _maxLives,
+                    value: _magazineSize,
                     min: 1,
-                    max: 20,
-                    divisions: 19,
-                    label: _maxLives.round().toString(),
+                    max: 60,
+                    divisions: 59,
+                    label: _magazineSize.round().toString(),
                     onChanged: (value) {
                       setState(() {
-                        _maxLives = value;
+                        _magazineSize = value;
+                      });
+                    },
+                  ),
+                  Text('Reload time: ${_reloadTimeSeconds.round()} seconds'),
+                  Slider(
+                    value: _reloadTimeSeconds,
+                    min: 0,
+                    max: 10,
+                    divisions: 10,
+                    label: _reloadTimeSeconds.round().toString(),
+                    onChanged: (value) {
+                      setState(() {
+                        _reloadTimeSeconds = value;
                       });
                     },
                   ),
@@ -490,19 +641,6 @@ class _ServerScreenState extends State<ServerScreen> {
                     onChanged: (value) {
                       setState(() {
                         _matchLength = value;
-                      });
-                    },
-                  ),
-                  Text('Max players: ${_maxPlayers.round()}'),
-                  Slider(
-                    value: _maxPlayers,
-                    min: 2,
-                    max: 20,
-                    divisions: 18,
-                    label: _maxPlayers.round().toString(),
-                    onChanged: (value) {
-                      setState(() {
-                        _maxPlayers = value;
                       });
                     },
                   ),
@@ -652,6 +790,11 @@ class _ServerScreenState extends State<ServerScreen> {
                     spacing: 12,
                     runSpacing: 12,
                     children: <Widget>[
+                      FilledButton.icon(
+                        onPressed: _openLobby,
+                        icon: const Icon(Icons.door_front_door),
+                        label: const Text('Open Lobby'),
+                      ),
                       FilledButton(
                         onPressed: _applyServerRules,
                         child: const Text('Save Rules'),

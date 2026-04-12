@@ -1,19 +1,37 @@
 class MediaConfic {
   MediaConfic._();
 
-  static const String audioBasePath = 'assets/media/audio';
+  static const String audioBasePath = 'media/audio';
 
   static const String laserShot = '$audioBasePath/laser_shot.mp3';
-  static const String playerHit = '$audioBasePath/player_hit.mp3';
-  static const String playerTag = '$audioBasePath/player_tag.mp3';
+  static const String shootingShort = '$audioBasePath/shootingshort.mp3';
+  static const String gunShot = '$audioBasePath/gun-shot.mp3';
   static const String reload = '$audioBasePath/reload.mp3';
+  static const String beep = '$audioBasePath/beep.mp3';
+  static const String score = '$audioBasePath/score.mp3';
+  static const String eliminated = '$audioBasePath/eliminated.mp3';
+  static const String spawn = '$audioBasePath/spawn.mp3';
+  static const String empty = '$audioBasePath/empty.mp3';
 
-  static const String itemHealing = '$audioBasePath/item_healing.mp3';
-  static const String itemArmor = '$audioBasePath/item_armor.mp3';
-  static const String itemDamage = '$audioBasePath/item_damage.mp3';
-  static const String itemSpecial = '$audioBasePath/item_special.mp3';
+  static const List<String> gunShotCandidates = <String>[
+    shootingShort,
+    gunShot,
+    laserShot,
+  ];
 
-  static const String matchStart = '$audioBasePath/match_start.mp3';
-  static const String matchEnd = '$audioBasePath/match_end.mp3';
-  static const String respawn = '$audioBasePath/respawn.mp3';
+  static const List<String> reloadCandidates = <String>[reload];
+
+  static const List<String> modeCandidates = <String>[beep];
+
+  static const List<String> hitCandidates = <String>[score, eliminated];
+
+  static const List<String> recoilEnabledCandidates = <String>[spawn, beep];
+
+  static const List<String> recoilDisabledCandidates = <String>[empty, beep];
+
+  static const List<String> connectCandidates = <String>[spawn];
+
+  static const List<String> disconnectCandidates = <String>[eliminated];
+
+  static String bundlePath(String assetPath) => 'assets/$assetPath';
 }

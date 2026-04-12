@@ -1,5 +1,9 @@
 Place game audio files in this folder.
 
+Optional SimpleCoil-compatible names used automatically on player screens:
+- shootingshort.mp3 (preferred shot sound)
+- laser_shot.mp3 (fallback shot sound)
+
 Suggested files used by lib/media_confic.dart:
 - laser_shot.mp3
 - player_hit.mp3

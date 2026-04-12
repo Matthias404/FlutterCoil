@@ -7,37 +7,49 @@ class GunProfile {
   const GunProfile({
     required this.displayName,
     required this.deviceId,
-    this.ammo = 120,
-    this.health = 100,
-    this.fireMode = FireMode.single,
-    this.damageMult = 1.0,
+    this.reloadButton = GunButton.reload,
+    this.shootButton = GunButton.trigger,
+    this.changeFireModeButton = GunButton.thumb,
+    this.selectedFireMode = FireMode.single,
+    this.allowSingleShotMode = true,
+    this.allowBurst3ShotMode = true,
+    this.allowAutoShotMode = true,
     this.recoilEnabled = true,
   });
 
   final String displayName;
   final String deviceId;
-  final int ammo;
-  final int health;
-  final FireMode fireMode;
-  final double damageMult;
+  final GunButton reloadButton;
+  final GunButton shootButton;
+  final GunButton changeFireModeButton;
+  final FireMode selectedFireMode;
+  final bool allowSingleShotMode;
+  final bool allowBurst3ShotMode;
+  final bool allowAutoShotMode;
   final bool recoilEnabled;
 
   GunProfile copyWith({
     String? displayName,
     String? deviceId,
-    int? ammo,
-    int? health,
-    FireMode? fireMode,
-    double? damageMult,
+    GunButton? reloadButton,
+    GunButton? shootButton,
+    GunButton? changeFireModeButton,
+    FireMode? selectedFireMode,
+    bool? allowSingleShotMode,
+    bool? allowBurst3ShotMode,
+    bool? allowAutoShotMode,
     bool? recoilEnabled,
   }) {
     return GunProfile(
       displayName: displayName ?? this.displayName,
       deviceId: deviceId ?? this.deviceId,
-      ammo: ammo ?? this.ammo,
-      health: health ?? this.health,
-      fireMode: fireMode ?? this.fireMode,
-      damageMult: damageMult ?? this.damageMult,
+      reloadButton: reloadButton ?? this.reloadButton,
+      shootButton: shootButton ?? this.shootButton,
+      changeFireModeButton: changeFireModeButton ?? this.changeFireModeButton,
+      selectedFireMode: selectedFireMode ?? this.selectedFireMode,
+      allowSingleShotMode: allowSingleShotMode ?? this.allowSingleShotMode,
+      allowBurst3ShotMode: allowBurst3ShotMode ?? this.allowBurst3ShotMode,
+      allowAutoShotMode: allowAutoShotMode ?? this.allowAutoShotMode,
       recoilEnabled: recoilEnabled ?? this.recoilEnabled,
     );
   }
@@ -46,10 +58,13 @@ class GunProfile {
     return <String, dynamic>{
       'displayName': displayName,
       'deviceId': deviceId,
-      'ammo': ammo,
-      'health': health,
-      'fireMode': fireMode.toString(),
-      'damageMult': damageMult,
+      'reloadButton': reloadButton.name,
+      'shootButton': shootButton.name,
+      'changeFireModeButton': changeFireModeButton.name,
+      'selectedFireMode': selectedFireMode.name,
+      'allowSingleShotMode': allowSingleShotMode,
+      'allowBurst3ShotMode': allowBurst3ShotMode,
+      'allowAutoShotMode': allowAutoShotMode,
       'recoilEnabled': recoilEnabled,
     };
   }
@@ -58,24 +73,65 @@ class GunProfile {
     return GunProfile(
       displayName: json['displayName'] as String? ?? 'LaserTag Gun',
       deviceId: json['deviceId'] as String? ?? '',
-      ammo: json['ammo'] as int? ?? 120,
-      health: json['health'] as int? ?? 100,
-      fireMode: _parseFireMode(
-        json['fireMode'] as String? ?? 'FireMode.single',
+      reloadButton: GunButton.reload,
+      shootButton: GunButton.trigger,
+      changeFireModeButton: GunButton.thumb,
+      selectedFireMode: _parseFireMode(
+        json['selectedFireMode'] as String?,
+        fallback: FireMode.single,
       ),
-      damageMult: (json['damageMult'] as num?)?.toDouble() ?? 1.0,
+      allowSingleShotMode: json['allowSingleShotMode'] as bool? ?? true,
+      allowBurst3ShotMode: json['allowBurst3ShotMode'] as bool? ?? true,
+      allowAutoShotMode: json['allowAutoShotMode'] as bool? ?? true,
       recoilEnabled: json['recoilEnabled'] as bool? ?? true,
     );
   }
 
-  static FireMode _parseFireMode(String modeStr) {
-    if (modeStr.contains('burst')) return FireMode.burst;
-    if (modeStr.contains('auto')) return FireMode.auto;
-    return FireMode.single;
+  static FireMode _parseFireMode(
+    String? rawValue, {
+    required FireMode fallback,
+  }) {
+    if (rawValue == null || rawValue.trim().isEmpty) {
+      return fallback;
+    }
+
+    return FireMode.values
+        .where((mode) => mode.name == rawValue)
+        .firstWhere((_) => true, orElse: () => fallback);
   }
 }
 
-enum FireMode { single, burst, auto }
+enum GunButton { trigger, reload, thumb, power }
+
+enum FireMode { single, burst3, auto }
+
+extension FireModeLabel on FireMode {
+  String get label {
+    switch (this) {
+      case FireMode.single:
+        return 'Single';
+      case FireMode.burst3:
+        return 'Burst 3';
+      case FireMode.auto:
+        return 'Full Auto';
+    }
+  }
+}
+
+extension GunButtonLabel on GunButton {
+  String get label {
+    switch (this) {
+      case GunButton.trigger:
+        return 'Trigger';
+      case GunButton.reload:
+        return 'Reload Button';
+      case GunButton.thumb:
+        return 'Thumb / Rear Button';
+      case GunButton.power:
+        return 'Power Button';
+    }
+  }
+}
 
 class GunProfileStorage {
   static const String _fileName = 'gun_profile.json';

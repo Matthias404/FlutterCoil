@@ -10,6 +10,9 @@ class PlayerState {
     required this.gunConnected,
     required this.isHost,
     required this.lastSeen,
+    this.latitude,
+    this.longitude,
+    this.isNetworkConnected = true,
   });
 
   final String id;
@@ -22,6 +25,9 @@ class PlayerState {
   final bool gunConnected;
   final bool isHost;
   final DateTime lastSeen;
+  final double? latitude;
+  final double? longitude;
+  final bool isNetworkConnected;
 
   PlayerState copyWith({
     String? id,
@@ -34,6 +40,9 @@ class PlayerState {
     bool? gunConnected,
     bool? isHost,
     DateTime? lastSeen,
+    double? latitude,
+    double? longitude,
+    bool? isNetworkConnected,
   }) {
     return PlayerState(
       id: id ?? this.id,
@@ -46,6 +55,9 @@ class PlayerState {
       gunConnected: gunConnected ?? this.gunConnected,
       isHost: isHost ?? this.isHost,
       lastSeen: lastSeen ?? this.lastSeen,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      isNetworkConnected: isNetworkConnected ?? this.isNetworkConnected,
     );
   }
 }

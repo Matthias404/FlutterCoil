@@ -59,10 +59,15 @@ void main() {
       await alpha.connect();
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
+      // Server (alpha) sees bravo as a game player.
       expect(alpha.snapshot.players.containsKey('bravo'), isTrue);
-      expect(bravo.snapshot.players.containsKey('alpha'), isTrue);
       expect(alpha.snapshot.players['bravo']?.name, 'Bravo');
-      expect(bravo.snapshot.players['alpha']?.name, 'Alpha');
+
+      // Server must NOT appear as a game player on client side.
+      expect(bravo.snapshot.players.containsKey('alpha'), isFalse);
+
+      // Bravo knows about itself in the synced player list.
+      expect(bravo.snapshot.players.containsKey('bravo'), isTrue);
     });
 
     test('records hit and score over simulated network', () async {

@@ -4,6 +4,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:lasertag_app/screens/player/player_game_screen.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -33,13 +34,11 @@ class LaserTagApp extends StatefulWidget {
 
 class _LaserTagAppState extends State<LaserTagApp> {
   late final AppThemeController _themeController;
-  late final bool _skipBootstrapForTests;
 
   @override
   void initState() {
     super.initState();
     _themeController = AppThemeController();
-    _skipBootstrapForTests = Platform.environment.containsKey('FLUTTER_TEST');
   }
 
   @override
@@ -60,9 +59,7 @@ class _LaserTagAppState extends State<LaserTagApp> {
             theme: buildLightTheme(),
             darkTheme: buildDarkTheme(),
             themeMode: _themeController.value,
-            home: _skipBootstrapForTests
-                ? const StartScreen()
-                : const _AppBootstrapGate(child: StartScreen()),
+            home: const _AppBootstrapGate(child: StartScreen()),
           );
         },
       ),
@@ -418,6 +415,7 @@ class _StartScreenState extends State<StartScreen> {
                                 icon: const Icon(Icons.sports_esports),
                                 label: const Text('Join As Player'),
                               ),
+                              
                             ],
                           ),
                         ),
@@ -435,9 +433,16 @@ class _StartScreenState extends State<StartScreen> {
 }
 
 class GameBrowserScreen extends StatefulWidget {
-  const GameBrowserScreen({super.key, this.allowManualCodeFallback = false});
+  const GameBrowserScreen({
+    super.key, 
+    this.allowManualCodeFallback = false,
+    this.playerName,
+    this.selectedTeam,
+  });
 
   final bool allowManualCodeFallback;
+  final String? playerName;
+  final String? selectedTeam;
 
   @override
   State<GameBrowserScreen> createState() => _GameBrowserScreenState();
@@ -740,7 +745,12 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
 
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PlayerScreenWithCode(joinCode: code),
+        builder: (_) => PlayerScreenWithCode(
+          joinCode: code,
+          initialPlayerName: widget.playerName,
+          initialTeam: widget.selectedTeam,
+          autoJoinOnOpen: widget.playerName?.trim().isNotEmpty == true,
+        ),
       ),
     );
   }

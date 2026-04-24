@@ -8,6 +8,7 @@ enum GunBatteryLevel { empty, low, medium, full }
 
 class GunTelemetrySample {
   const GunTelemetrySample({
+    required this.recoilPlayerId,
     required this.buttons,
     required this.triggerCounter,
     required this.reloadCounter,
@@ -23,6 +24,7 @@ class GunTelemetrySample {
     required this.status,
   });
 
+  final int recoilPlayerId;
   final int buttons;
   final int triggerCounter;
   final int reloadCounter;
@@ -58,6 +60,15 @@ class BleGunController {
 
   static final Map<String, Future<void>> _configWriteLocks =
       <String, Future<void>>{};
+  static final Map<String, Future<void>> _commandWriteLocks =
+      <String, Future<void>>{};
+  static final Map<String, int> _commandIds = <String, int>{};
+  static final Map<String, BluetoothCharacteristic> _configCharacteristics =
+    <String, BluetoothCharacteristic>{};
+  static final Map<String, BluetoothCharacteristic> _telemetryCharacteristics =
+    <String, BluetoothCharacteristic>{};
+  static final Map<String, BluetoothCharacteristic> _commandCharacteristics =
+    <String, BluetoothCharacteristic>{};
 
   // SimpleCoil / RECOIL UUIDs.
   static final Guid _recoilMainServiceUuid = Guid(
@@ -69,8 +80,12 @@ class BleGunController {
   static final Guid _recoilTelemetryCharacteristicUuid = Guid(
     'e6f59d12-8230-4a5c-b22f-c062b1d329e3',
   );
+  static final Guid _recoilCommandCharacteristicUuid = Guid(
+    'e6f59d13-8230-4a5c-b22f-c062b1d329e3',
+  );
 
   static const int _recoilTelemetryBatteryOffset = 7;
+  static const int _recoilTelemetryTeamOffset = 1;
   static const int _recoilTelemetryButtonsOffset = 2;
   static const int _recoilTelemetryReloadTriggerCounterOffset = 3;
   static const int _recoilTelemetryThumbCounterOffset = 4;
@@ -83,7 +98,8 @@ class BleGunController {
   static const int _recoilTelemetryStatusOffset = 15;
 
   // Force pistol behavior for RECOIL profile tuning.
-  static const int _pistolFiringModeByte5 = 0xFF;
+  static const int _pistolOutdoorFiringModeByte5 = 0xFF;
+  static const int _pistolIndoorFiringModeByte5 = 0x19;
   static const int _pistolFiringModeByte6 = 0x00;
   static const int _pistolRecoilStrength = 0x80;
 
@@ -112,6 +128,12 @@ class BleGunController {
   static Future<BluetoothCharacteristic> _configCharacteristicForDevice(
     String deviceId,
   ) async {
+    final key = _normalizeDeviceId(deviceId);
+    final cached = _configCharacteristics[key];
+    if (cached != null) {
+      return cached;
+    }
+
     final device = await connect(deviceId: deviceId);
 
     final services = await device.discoverServices();
@@ -140,12 +162,19 @@ class BleGunController {
       );
     }
 
+    _configCharacteristics[key] = characteristic;
     return characteristic;
   }
 
   static Future<BluetoothCharacteristic> _telemetryCharacteristicForDevice(
     String deviceId,
   ) async {
+    final key = _normalizeDeviceId(deviceId);
+    final cached = _telemetryCharacteristics[key];
+    if (cached != null) {
+      return cached;
+    }
+
     final device = await connect(deviceId: deviceId);
 
     final services = await device.discoverServices();
@@ -174,7 +203,118 @@ class BleGunController {
       );
     }
 
+    _telemetryCharacteristics[key] = characteristic;
     return characteristic;
+  }
+
+  static Future<BluetoothCharacteristic> _commandCharacteristicForDevice(
+    String deviceId,
+  ) async {
+    final key = _normalizeDeviceId(deviceId);
+    final cached = _commandCharacteristics[key];
+    if (cached != null) {
+      return cached;
+    }
+
+    final device = await connect(deviceId: deviceId);
+
+    final services = await device.discoverServices();
+    final service = services
+        .where((candidate) => candidate.uuid == _recoilMainServiceUuid)
+        .cast<BluetoothService?>()
+        .firstWhere((candidate) => candidate != null, orElse: () => null);
+    if (service == null) {
+      throw StateError('SimpleCoil RECOIL service not found on the gun.');
+    }
+
+    final characteristic = service.characteristics
+        .where(
+          (candidate) => candidate.uuid == _recoilCommandCharacteristicUuid,
+        )
+        .cast<BluetoothCharacteristic?>()
+        .firstWhere((candidate) => candidate != null, orElse: () => null);
+    if (characteristic == null) {
+      throw StateError('SimpleCoil RECOIL command characteristic not found.');
+    }
+
+    final supportsWrite = characteristic.properties.write;
+    final supportsWriteNoResponse =
+        characteristic.properties.writeWithoutResponse;
+    if (!supportsWrite && !supportsWriteNoResponse) {
+      throw StateError(
+        'SimpleCoil RECOIL command characteristic is not writable.',
+      );
+    }
+
+    _commandCharacteristics[key] = characteristic;
+    return characteristic;
+  }
+
+  static int _nextCommandId(String deviceId) {
+    final key = _normalizeDeviceId(deviceId);
+    final current = _commandIds[key] ?? 0;
+    _commandIds[key] = (current + 0x10) & 0xFF;
+    return current & 0xFF;
+  }
+
+  static Future<void> setPlayerId({
+    required String deviceId,
+    required int playerId,
+  }) async {
+    if (playerId < 1 || playerId > 63) {
+      throw RangeError.range(playerId, 1, 63, 'playerId');
+    }
+
+    final characteristic = await _commandCharacteristicForDevice(deviceId);
+    final command = List<int>.filled(20, 0);
+    command[0] = _nextCommandId(deviceId);
+    command[2] = 0x80;
+    command[4] = playerId & 0xFF;
+
+    await _writeCommand(
+      deviceId: deviceId,
+      characteristic: characteristic,
+      data: command,
+    );
+  }
+
+  static Future<void> reloadAmmo({
+    required String deviceId,
+    required int playerId,
+    int shotCount = 30,
+  }) async {
+    if (playerId < 1 || playerId > 63) {
+      throw RangeError.range(playerId, 1, 63, 'playerId');
+    }
+
+    final normalizedShotCount = shotCount.clamp(1, 255);
+    final characteristic = await _commandCharacteristicForDevice(deviceId);
+
+    // Stage 1: enter reload status (F0 00 02 00 PLAYER_ID ...)
+    final reloadStart = List<int>.filled(20, 0);
+    reloadStart[0] = _nextCommandId(deviceId);
+    reloadStart[2] = 0x02;
+    reloadStart[4] = playerId & 0xFF;
+    await _writeCommand(
+      deviceId: deviceId,
+      characteristic: characteristic,
+      data: reloadStart,
+    );
+
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+
+    // Stage 2: load shots and allow fire (00 00 04 00 PLAYER_ID 00 SHOTS ...)
+    final reloadFinish = List<int>.filled(20, 0);
+    reloadFinish[0] = _nextCommandId(deviceId);
+    reloadFinish[2] = 0x04;
+    reloadFinish[4] = playerId & 0xFF;
+    reloadFinish[5] = 0x00;
+    reloadFinish[6] = normalizedShotCount;
+    await _writeCommand(
+      deviceId: deviceId,
+      characteristic: characteristic,
+      data: reloadFinish,
+    );
   }
 
   static Stream<GunBatteryLevel> watchBatteryLevel({
@@ -206,6 +346,7 @@ class BleGunController {
     final batteryRaw = value[_recoilTelemetryBatteryOffset] & 0xFF;
 
     return GunTelemetrySample(
+      recoilPlayerId: value[_recoilTelemetryTeamOffset] & 0xFF,
       buttons: value[_recoilTelemetryButtonsOffset] & 0xFF,
       triggerCounter: triggerCounter,
       reloadCounter: reloadCounter,
@@ -238,6 +379,7 @@ class BleGunController {
   static Future<void> setShotMode({
     required String deviceId,
     required FireMode mode,
+    bool useIndoorProfile = false,
   }) async {
     final characteristic = await _configCharacteristicForDevice(deviceId);
 
@@ -247,7 +389,9 @@ class BleGunController {
     config[0] = 0x00;
     config[2] = 0x09;
     // Always use pistol profile tuning.
-    config[5] = _pistolFiringModeByte5;
+    config[5] = useIndoorProfile
+        ? _pistolIndoorFiringModeByte5
+        : _pistolOutdoorFiringModeByte5;
     config[6] = _pistolFiringModeByte6;
     config[7] = 0xFF;
     config[8] = 0xFF;
@@ -288,7 +432,11 @@ class BleGunController {
     }
 
     final device = deviceFromId(deviceId);
+    final key = _normalizeDeviceId(deviceId);
     if (device.isDisconnected) {
+      _configCharacteristics.remove(key);
+      _telemetryCharacteristics.remove(key);
+      _commandCharacteristics.remove(key);
       try {
         await device.connect(timeout: timeout);
       } on Exception {
@@ -355,7 +503,7 @@ class BleGunController {
     final supportsWrite = characteristic.properties.write;
     final supportsWriteNoResponse =
         characteristic.properties.writeWithoutResponse;
-    final withoutResponse = supportsWriteNoResponse && !supportsWrite;
+    final withoutResponse = supportsWriteNoResponse;
 
     final queueKey = _normalizeDeviceId(deviceId);
     final previous = _configWriteLocks[queueKey] ?? Future<void>.value();
@@ -371,12 +519,36 @@ class BleGunController {
     return next;
   }
 
+  static Future<void> _writeCommand({
+    required String deviceId,
+    required BluetoothCharacteristic characteristic,
+    required List<int> data,
+  }) {
+    final supportsWrite = characteristic.properties.write;
+    final supportsWriteNoResponse =
+        characteristic.properties.writeWithoutResponse;
+    final withoutResponse = supportsWriteNoResponse;
+
+    final queueKey = _normalizeDeviceId(deviceId);
+    final previous = _commandWriteLocks[queueKey] ?? Future<void>.value();
+    final next = previous.then((_) async {
+      await characteristic.write(
+        data,
+        withoutResponse: withoutResponse,
+        timeout: 1500,
+      );
+    });
+
+    _commandWriteLocks[queueKey] = next.catchError((_) {});
+    return next;
+  }
+
   static Future<void> pulseRecoil({required String deviceId}) async {
     final characteristic = await _configCharacteristicForDevice(deviceId);
     final supportsWrite = characteristic.properties.write;
     final supportsWriteNoResponse =
         characteristic.properties.writeWithoutResponse;
-    final withoutResponse = supportsWriteNoResponse && !supportsWrite;
+    final withoutResponse = supportsWriteNoResponse;
 
     // Off command: 10 00 02 02 ff ...
     final recoilOff = List<int>.filled(20, 0);

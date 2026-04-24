@@ -46,11 +46,13 @@ class _ServerScreenState extends State<ServerScreen> {
   double _itemSpawnRateSeconds = _itemSpawnMinSeconds;
   double _hillRadiusMeters = 2.0;
   _GameModePreset _selectedPreset = _GameModePreset.time;
+  FiringEnvironment _firingEnvironment = FiringEnvironment.outdoor;
   RespawnMode _respawnMode = RespawnMode.onDeath;
   bool _friendlyFire = false;
   bool _allowMidGameJoin = true;
   bool _teamLeadVoiceOnly = true;
   bool _showOtherPlayersOnMap = true;
+  bool _isLobbyOpen = false;
 
   GameType _gameTypeForPreset(_GameModePreset preset) {
     switch (preset) {
@@ -137,6 +139,7 @@ class _ServerScreenState extends State<ServerScreen> {
       setState(() {
         _selectedPreset = _presetForGameType(snapshot.lobbyRules.gameType);
         _snapshot = snapshot;
+        _firingEnvironment = snapshot.lobbyRules.firingEnvironment;
         _maxLives = snapshot.lobbyRules.maxLives.toDouble();
         _magazineSize = snapshot.lobbyRules.magazineSize.toDouble();
         _reloadTimeSeconds = snapshot.lobbyRules.reloadTimeSeconds.toDouble();
@@ -224,13 +227,13 @@ class _ServerScreenState extends State<ServerScreen> {
         case _GameModePreset.lives:
           _matchLength = 10;
           _maxLives = 3;
-          _respawnDelaySeconds = 0;
+          _respawnDelaySeconds = 3;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = false;
         case _GameModePreset.teamLives:
           _matchLength = 10;
           _maxLives = 15;
-          _respawnDelaySeconds = 0;
+          _respawnDelaySeconds = 3;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = false;
         case _GameModePreset.kingOfTheHill:
@@ -245,11 +248,12 @@ class _ServerScreenState extends State<ServerScreen> {
           _maxLives = 8;
           _respawnDelaySeconds = 2;
           _itemSpawnRateSeconds = 45;
-          _friendlyFire = false;
+          _friendlyFire = true;
       }
 
       _itemSpawnRateSeconds = _normalizeItemSpawnRate(_itemSpawnRateSeconds);
-      _status = '${_gameModePresetLabel(preset)} preset selected. Save rules to apply.';
+      _status =
+          '${_gameModePresetLabel(preset)} preset selected. Save rules to apply.';
     });
   }
 
@@ -273,6 +277,7 @@ class _ServerScreenState extends State<ServerScreen> {
     await _service.updateLobbyRules(
       LobbyRules(
         gameType: _gameTypeForPreset(_selectedPreset),
+        firingEnvironment: _firingEnvironment,
         magazineSize: _magazineSize.round(),
         reloadTimeSeconds: _reloadTimeSeconds.round(),
         maxLives: _maxLives.round(),
@@ -300,18 +305,6 @@ class _ServerScreenState extends State<ServerScreen> {
     });
   }
 
-  Future<void> _queueGameStart() async {
-    await _service.queueGameStart();
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _status =
-          'Game start queued. Match starts in 60s or when all Team Leads are ready.';
-    });
-  }
-
   Future<void> _openLobby() async {
     await _applyServerRules();
     if (!mounted) {
@@ -319,8 +312,38 @@ class _ServerScreenState extends State<ServerScreen> {
     }
 
     setState(() {
+      _isLobbyOpen = true;
       _status = 'Lobby is open. Players can now join using the join code.';
     });
+
+    if (!mounted) {
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ServerLobbyOverviewScreen(
+          service: _service,
+          joinCode: JoinCodeCodec.encode(
+            PeerEndpoint(
+              host: _advertisedHostController.text.trim().isEmpty
+                  ? '127.0.0.1'
+                  : _advertisedHostController.text.trim(),
+              port: _serverPort,
+            ),
+          ),
+          onCloseLobby: () {
+            if (!mounted) {
+              return;
+            }
+            setState(() {
+              _isLobbyOpen = false;
+              _status = 'Lobby closed.';
+            });
+          },
+        ),
+      ),
+    );
   }
 
   Widget _buildModeDescription(_GameModePreset preset) {
@@ -363,7 +386,6 @@ class _ServerScreenState extends State<ServerScreen> {
       alpha: brightness == Brightness.dark ? 0.4 : 0.25,
     );
     final snapshot = _snapshot;
-    final players = snapshot?.players.values.toList() ?? const <PlayerState>[];
     final joinEndpoint = PeerEndpoint(
       host: _advertisedHostController.text.trim().isEmpty
           ? '127.0.0.1'
@@ -399,6 +421,48 @@ class _ServerScreenState extends State<ServerScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: <Widget>[
+            if (_isLobbyOpen)
+              Card(
+                color: Colors.green.shade700,
+                margin: const EdgeInsets.only(bottom: 8),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      const Icon(
+                        Icons.meeting_room,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text(
+                          'Lobby is open — players can join',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () {
+                          setState(() {
+                            _isLobbyOpen = false;
+                            _status = 'Lobby closed.';
+                          });
+                        },
+                        child: const Text(
+                          'Close',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             Text('Status: $_status'),
             const SizedBox(height: 8),
             Text(
@@ -568,7 +632,30 @@ class _ServerScreenState extends State<ServerScreen> {
                   const SizedBox(height: 6),
                   _buildModeDescription(_selectedPreset),
                   const SizedBox(height: 8),
-                  if (_selectedPreset != _GameModePreset.kingOfTheHill) ...<Widget>[
+                  Text('Firing environment: ${_firingEnvironment.label}'),
+                  SegmentedButton<FiringEnvironment>(
+                    segments: const <ButtonSegment<FiringEnvironment>>[
+                      ButtonSegment<FiringEnvironment>(
+                        value: FiringEnvironment.outdoor,
+                        icon: Icon(Icons.terrain),
+                        label: Text('Outdoor'),
+                      ),
+                      ButtonSegment<FiringEnvironment>(
+                        value: FiringEnvironment.indoor,
+                        icon: Icon(Icons.home_work),
+                        label: Text('Indoor'),
+                      ),
+                    ],
+                    selected: <FiringEnvironment>{_firingEnvironment},
+                    onSelectionChanged: (selection) {
+                      setState(() {
+                        _firingEnvironment = selection.first;
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  if (_selectedPreset !=
+                      _GameModePreset.kingOfTheHill) ...<Widget>[
                     Text(
                       _selectedPreset == _GameModePreset.teamLives
                           ? 'Team lives pool: ${_maxLives.round()}'
@@ -587,7 +674,8 @@ class _ServerScreenState extends State<ServerScreen> {
                       },
                     ),
                   ],
-                  if (_selectedPreset == _GameModePreset.kingOfTheHill) ...<Widget>[
+                  if (_selectedPreset ==
+                      _GameModePreset.kingOfTheHill) ...<Widget>[
                     Text(
                       'Hill radius: ${_hillRadiusMeters.toStringAsFixed(1)} m',
                     ),
@@ -599,8 +687,7 @@ class _ServerScreenState extends State<ServerScreen> {
                       label: '${_hillRadiusMeters.toStringAsFixed(1)} m',
                       onChanged: (value) {
                         setState(() {
-                          _hillRadiusMeters =
-                              (value / 0.5).round() * 0.5;
+                          _hillRadiusMeters = (value / 0.5).round() * 0.5;
                         });
                       },
                     ),
@@ -774,18 +861,6 @@ class _ServerScreenState extends State<ServerScreen> {
                       });
                     },
                   ),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        setState(() {
-                          _teamLeadVoiceOnly = false;
-                        });
-                      },
-                      icon: const Icon(Icons.record_voice_over),
-                      label: const Text('Allow All Players To Talk'),
-                    ),
-                  ),
                   Wrap(
                     spacing: 12,
                     runSpacing: 12,
@@ -795,43 +870,234 @@ class _ServerScreenState extends State<ServerScreen> {
                         icon: const Icon(Icons.door_front_door),
                         label: const Text('Open Lobby'),
                       ),
-                      FilledButton(
-                        onPressed: _applyServerRules,
-                        child: const Text('Save Rules'),
-                      ),
-                      FilledButton(
-                        onPressed: _queueGameStart,
-                        child: Text(
-                          scheduledStartAt == null
-                              ? 'Start In 60s'
-                              : 'Restart 60s Timer',
-                        ),
-                      ),
-                      OutlinedButton(
-                        onPressed: _service.endGame,
-                        child: const Text('End Game'),
-                      ),
                     ],
                   ),
                 ],
               ),
             ),
-            const Divider(height: 24),
-            Text('Players (${players.length})'),
-            const SizedBox(height: 8),
-            ...players.map(
-              (player) => ListTile(
-                title: Text(player.name),
-                subtitle: Text(
-                  'group=${player.group} gun=${player.gunConnected ? 'connected' : 'not connected'} '
-                  'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} score=${player.score} lives hit=${player.hitsTaken}',
-                ),
-                trailing: player.isHost ? const Icon(Icons.shield) : null,
-              ),
-            ),
             const SizedBox(height: 12),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class ServerLobbyOverviewScreen extends StatefulWidget {
+  const ServerLobbyOverviewScreen({
+    super.key,
+    required this.service,
+    required this.joinCode,
+    required this.onCloseLobby,
+  });
+
+  final GameNetworkService service;
+  final String joinCode;
+  final VoidCallback onCloseLobby;
+
+  @override
+  State<ServerLobbyOverviewScreen> createState() =>
+      _ServerLobbyOverviewScreenState();
+}
+
+class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
+  StreamSubscription<NetworkSnapshot>? _updatesSub;
+  NetworkSnapshot? _snapshot;
+  String _status = 'Lobby is open.';
+
+  @override
+  void initState() {
+    super.initState();
+    _snapshot = widget.service.snapshot;
+    _updatesSub = widget.service.updates.listen((snapshot) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _snapshot = snapshot;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _updatesSub?.cancel();
+    super.dispose();
+  }
+
+  String _formatCountdown(Duration duration) {
+    final totalSeconds = duration.inSeconds.clamp(0, 3599);
+    final minutes = (totalSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  Future<void> _startIn60Seconds() async {
+    await widget.service.queueGameStart();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _status =
+          'Game start queued. Match starts in 60s or when all Team Leads are ready.';
+    });
+  }
+
+  Future<void> _endGame() async {
+    await widget.service.endGame();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _status = 'Game ended by server.';
+    });
+  }
+
+  void _closeLobby() {
+    widget.onCloseLobby();
+    if (!mounted) {
+      return;
+    }
+    Navigator.of(context).pop();
+  }
+
+  String _respawnLabel(RespawnMode mode) {
+    switch (mode) {
+      case RespawnMode.onDeath:
+        return 'On Death';
+      case RespawnMode.atTeamBase:
+        return 'At Team Base';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final snapshot = _snapshot;
+    final players = snapshot?.players.values.toList() ?? const <PlayerState>[];
+    final rules = snapshot?.lobbyRules;
+    final scheduledStartAt = snapshot?.scheduledGameStartAt;
+    final countdown = scheduledStartAt?.difference(DateTime.now());
+    final countdownLabel = countdown == null
+        ? null
+        : _formatCountdown(countdown);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Lobby Overview')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: <Widget>[
+          Card(
+            color: Colors.green.shade700,
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                children: <Widget>[
+                  Icon(Icons.check_circle, color: Colors.white),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Lobby is open and accepting players.',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text('Status: $_status'),
+          const SizedBox(height: 4),
+          Text('Join code: ${widget.joinCode}'),
+          if (countdownLabel != null) ...<Widget>[
+            const SizedBox(height: 4),
+            Text('Start countdown: $countdownLabel'),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: <Widget>[
+              FilledButton(
+                onPressed: _startIn60Seconds,
+                child: const Text('Start In 60s'),
+              ),
+              OutlinedButton(
+                onPressed: _endGame,
+                child: const Text('End Game'),
+              ),
+              TextButton(
+                onPressed: _closeLobby,
+                child: const Text('Close Lobby'),
+              ),
+            ],
+          ),
+          const Divider(height: 28),
+          Text(
+            'Settings overview',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          if (rules != null)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text('Mode: ${rules.gameType.label}'),
+                    Text(
+                      'Firing environment: ${rules.firingEnvironment.label}',
+                    ),
+                    Text('Magazine size: ${rules.magazineSize}'),
+                    Text('Reload time: ${rules.reloadTimeSeconds}s'),
+                    Text('Max lives: ${rules.maxLives}'),
+                    Text('Match length: ${rules.matchLengthMinutes}m'),
+                    Text('Respawn delay: ${rules.respawnDelaySeconds}s'),
+                    Text('Respawn mode: ${_respawnLabel(rules.respawnMode)}'),
+                    Text(
+                      'Hill radius: ${rules.hillRadiusMeters.toStringAsFixed(1)}m',
+                    ),
+                    Text(
+                      rules.itemSpawnRateSeconds <= 0
+                          ? 'Item spawn: never'
+                          : 'Item spawn: ${rules.itemSpawnRateSeconds}s',
+                    ),
+                    Text('Friendly fire: ${rules.friendlyFire ? 'On' : 'Off'}'),
+                    Text(
+                      'Allow mid-game join: ${rules.allowMidGameJoin ? 'On' : 'Off'}',
+                    ),
+                    Text(
+                      'Team lead voice only: ${rules.teamLeadVoiceOnly ? 'On' : 'Off'}',
+                    ),
+                    Text(
+                      'Show other players on map: ${rules.showOtherPlayersOnMap ? 'On' : 'Off'}',
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            const Text('No settings available yet.'),
+          const Divider(height: 28),
+          Text(
+            'Players (${players.length})',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          ...players.map(
+            (player) => ListTile(
+              title: Text(player.name),
+              subtitle: Text(
+                'group=${player.group} gun=${player.gunConnected ? 'connected' : 'not connected'} '
+                'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} score=${player.score} hits=${player.hitsTaken}',
+              ),
+              trailing: player.isHost ? const Icon(Icons.shield) : null,
+            ),
+          ),
+        ],
       ),
     );
   }

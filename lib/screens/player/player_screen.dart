@@ -5,17 +5,20 @@ import 'dart:io';
 import 'package:audioplayers/audioplayers.dart' hide PlayerState;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import '../../media_confic.dart';
 import '../../main.dart';
 import '../../network/game_network_service.dart';
+import '../../network/item_definitions.dart';
 import '../../network/join_code.dart';
 import '../../network/peer_directory.dart';
 import '../../network/transport.dart';
 import '../../network/udp_transport.dart';
 import '../../screens/player/gun_settings_screen.dart';
+import '../../screens/player/player_lobby_screen.dart';
 import '../../screens/player/lobby_rules_help_screen.dart';
 import '../../theme/team_colors.dart';
 import '../../theme/theme_toggle_button.dart';
@@ -38,6 +41,7 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> {
   static const int _playerPort = 7778;
   static const List<String> _teams = <String>['Red', 'Blue', 'Green', 'Yellow'];
+  static const Duration _gunConnectTimeout = Duration(seconds: 8);
 
   late final GameNetworkService _service;
   late final PeerDirectory _peerDirectory;
@@ -48,6 +52,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   late final AudioPlayer _gunSfxPlayer;
   String _gunShotAssetPath = MediaConfic.laserShot;
   String? _reloadSoundAssetPath;
+  String? _healSoundAssetPath;
   String? _modeSoundAssetPath;
   String? _hitSoundAssetPath;
   String? _recoilEnabledSoundAssetPath;
@@ -59,19 +64,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
   StreamSubscription<bool>? _gunConnectionSub;
   StreamSubscription<GunBatteryLevel>? _gunBatterySub;
   StreamSubscription<GunTelemetrySample>? _gunTelemetrySub;
+  StreamSubscription<Position>? _gpsSub;
   NetworkSnapshot? _snapshot;
   String _status = 'Fill in your player profile.';
   String _voiceStatus = 'Team voice ready.';
   bool _gunConnected = false;
   bool _showGunDisconnectedAlert = false;
   bool _showJoinCodeFallback = false;
-  bool _autoOpenedGunSetup = false;
+  bool _isConnectingGun = false;
   bool _isRecordingVoice = false;
   bool _recoilEnabled = true;
   GunBatteryLevel? _gunBatteryLevel;
   int? _ammoRemaining;
   String _selectedTeam = 'Red';
   GunProfile? _savedGunProfile;
+  GameItemPickupNotification? _latestPickupNotification;
+  final Set<String> _playedEffectIds = <String>{};
+  final Set<String> _playedBombPickupIds = <String>{};
+  Timer? _killOverlayTimer;
+  String? _killOverlayMessage;
   int? _lastTriggerCounter;
   int? _lastReloadCounter;
   int? _lastStartCounter;
@@ -161,6 +172,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _playOptionalActionSound(_reloadSoundAssetPath);
   }
 
+  Future<void> _playItemUseSound(GameItemEffectType effectType) async {
+    final sound = ItemRegistry.of(effectType)?.useSound;
+    await _playOptionalActionSound(sound);
+  }
+
+  void _showKillOverlay(String message) {
+    setState(() => _killOverlayMessage = message);
+    _killOverlayTimer?.cancel();
+    _killOverlayTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _killOverlayMessage = null);
+    });
+  }
+
   Future<void> _playActionSound(String assetPath, {Duration? cutoff}) async {
     await _gunSfxPlayer.stop();
     await _gunSfxPlayer.play(AssetSource(assetPath), volume: 1.0);
@@ -204,6 +228,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _gunShotAssetPath;
     _reloadSoundAssetPath = await _resolveFirstExistingAsset(
       MediaConfic.reloadCandidates,
+    );
+    _healSoundAssetPath = await _resolveFirstExistingAsset(
+      MediaConfic.healCandidates,
     );
     _modeSoundAssetPath = await _resolveFirstExistingAsset(
       MediaConfic.modeCandidates,
@@ -263,8 +290,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _gunConnected = gunConnected;
       _showGunDisconnectedAlert = false;
       if (!gunConnected) {
-        _status =
-            'Connect a Bluetooth gun first. Opening Gun Connection screen...';
+        _status = 'Connect last gun or open Gun Settings to pair a gun.';
       }
     });
 
@@ -272,24 +298,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await _startGunConnectionMonitoring(profile);
       await _startBatteryMonitoring(profile);
       await _startTelemetryMonitoring(profile);
-      return;
-    }
-
-    if (!_autoOpenedGunSetup) {
-      _autoOpenedGunSetup = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) {
-          return;
-        }
-        unawaited(_openGunSettings());
-      });
     }
   }
 
   Future<void> _searchLanAndHandleFallback() async {
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      setState(() {
+        _status = 'Enter your player name before searching for games.';
+      });
+      return;
+    }
+
     final useJoinCodeFallback = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
-        builder: (_) => const GameBrowserScreen(allowManualCodeFallback: true),
+        builder: (_) => GameBrowserScreen(
+          allowManualCodeFallback: true,
+          playerName: name,
+          selectedTeam: _selectedTeam,
+        ),
       ),
     );
 
@@ -303,7 +330,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _status =
             'No LAN lobbies found. Paste a lobby join code to connect manually.';
       });
+      return;
     }
+
+    // A selected game opens its own join flow; do not open lobby from here.
+  }
+
+  Future<void> _openLobbyScreen() async {
+    if (!mounted) {
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PlayerLobbyScreen(
+          service: _service,
+          initialTeam: _selectedTeam,
+        ),
+      ),
+    );
   }
 
   Future<void> _startGunConnectionMonitoring(GunProfile profile) async {
@@ -497,12 +542,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    if (_isConnectingGun) {
+      return;
+    }
+
     setState(() {
+      _isConnectingGun = true;
       _status = loadingStatus;
     });
 
     try {
-      await BleGunController.connect(deviceId: profile.deviceId);
+      await BleGunController.connect(
+        deviceId: profile.deviceId,
+      ).timeout(_gunConnectTimeout);
       if (!mounted) {
         return;
       }
@@ -521,6 +573,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await _applyShotModeToGun(profile: profile);
       await _applyRecoilModeToGun(profile: profile);
       await _service.updateLocalProfile(gunConnected: true);
+    } on TimeoutException {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _savedGunProfile = profile;
+        _recoilEnabled = profile.recoilEnabled;
+        _gunConnected = false;
+        _showGunDisconnectedAlert = true;
+        _status =
+            'Connection timed out for ${profile.displayName}. Check power/Bluetooth and try again.';
+      });
+      await _service.updateLocalProfile(gunConnected: false);
     } catch (_) {
       if (!mounted) {
         return;
@@ -535,6 +601,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
             'Could not connect to ${profile.displayName}. Check Bluetooth and try Reconnect Gun.';
       });
       await _service.updateLocalProfile(gunConnected: false);
+    } finally {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isConnectingGun = false;
+      });
     }
   }
 
@@ -557,9 +630,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _applyShotModeToGun({required GunProfile profile}) async {
     try {
+      final useIndoorProfile =
+          _snapshot?.lobbyRules.firingEnvironment == FiringEnvironment.indoor;
       await BleGunController.setShotMode(
         deviceId: profile.deviceId,
         mode: profile.selectedFireMode,
+        useIndoorProfile: useIndoorProfile,
       );
     } catch (_) {
       if (!mounted) {
@@ -654,6 +730,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _bootstrap() async {
     await _service.start();
     _teamVoiceSub = _service.teamVoiceMessages.listen(_onTeamVoiceReceived);
+    _service.killEvents.listen((kill) {
+      if (!mounted) return;
+      if (kill.victimPlayerId == _service.localPlayerId) {
+        _showKillOverlay('Killed by ${kill.killerName}');
+      } else if (kill.killerPlayerId == _service.localPlayerId) {
+        _showKillOverlay('You eliminated ${kill.victimName}!');
+      }
+    });
     _service.updates.listen((snapshot) {
       if (!mounted) {
         return;
@@ -661,8 +745,49 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       setState(() {
         _snapshot = snapshot;
+        _latestPickupNotification = snapshot.recentItemPickups.isEmpty
+            ? null
+            : snapshot.recentItemPickups.last;
       });
+
+      // Bomb dropping sound for every air strike pickup, heard by all players.
+      final newBombs = snapshot.recentItemPickups.where(
+        (p) =>
+            p.effectType == GameItemEffectType.airStrike &&
+            _playedBombPickupIds.add(p.id),
+      );
+      if (newBombs.isNotEmpty) {
+        unawaited(_playOptionalActionSound(MediaConfic.bombDropping));
+        Future<void>.delayed(const Duration(seconds: 7)).then((_) {
+          if (mounted) unawaited(_playOptionalActionSound(MediaConfic.explosion));
+        });
+      }
+
+      final newEffects = snapshot.activeEffects.where(
+        (effect) =>
+            effect.playerId == snapshot.localPlayerId &&
+            _playedEffectIds.add(effect.id),
+      );
+      for (final effect in newEffects) {
+        unawaited(_playItemUseSound(effect.effectType));
+      }
     });
+    _startGpsUpdates();
+  }
+
+  void _startGpsUpdates() {
+    _gpsSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 5,
+            timeLimit: Duration(milliseconds: 1500),
+          ),
+        ).listen((position) {
+          unawaited(
+            _service.updateGpsPosition(position.latitude, position.longitude),
+          );
+        });
   }
 
   @override
@@ -671,8 +796,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _gunConnectionSub?.cancel();
     _gunBatterySub?.cancel();
     _gunTelemetrySub?.cancel();
+    _gpsSub?.cancel();
     _nameController.dispose();
     _joinCodeController.dispose();
+    _killOverlayTimer?.cancel();
     _service.stop();
     unawaited(_voiceRecorder.dispose());
     unawaited(_voicePlayer.dispose());
@@ -849,13 +976,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    if (!_gunConnected) {
-      setState(() {
-        _status = 'Connect the Bluetooth gun before joining the game.';
-      });
-      return;
-    }
-
     PeerEndpoint serverEndpoint;
     try {
       serverEndpoint = JoinCodeCodec.decode(joinCode);
@@ -873,7 +993,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       group: _selectedTeam,
       gunConnected: _gunConnected,
     );
-    await _service.connect();
+    unawaited(_service.connect());
 
     if (!mounted) {
       return;
@@ -882,6 +1002,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
     setState(() {
       _status =
           'Joining lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
+    });
+
+    await _openLobbyScreen();
+  }
+
+  Future<void> _handleTeamSelectionChanged(
+    String team, {
+    required bool hasJoinedLobby,
+  }) async {
+    if (_selectedTeam == team) {
+      return;
+    }
+
+    setState(() {
+      _selectedTeam = team;
+    });
+
+    if (!hasJoinedLobby) {
+      return;
+    }
+
+    await _service.updateLocalProfile(group: team, gunConnected: _gunConnected);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _status = 'Team changed to $team.';
     });
   }
 
@@ -960,20 +1107,132 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return Icon(Icons.circle, color: teamPaletteFor(team).accent);
   }
 
+  String _localActiveEffectsLabel(NetworkSnapshot? snapshot) {
+    final localEffects =
+        snapshot?.activeEffects
+            .where((effect) => effect.playerId == _service.localPlayerId)
+            .map((effect) => effect.effectType.label)
+            .toList() ??
+        const <String>[];
+    if (localEffects.isEmpty) {
+      return 'No active item effects';
+    }
+    return 'Active effects: ${localEffects.join(' • ')}';
+  }
+
+  Widget _buildKillOverlay() {
+    final message = _killOverlayMessage;
+    if (message == null) return const SizedBox.shrink();
+    return Positioned(
+      bottom: 120,
+      left: 24,
+      right: 24,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.88),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.redAccent, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                const Icon(Icons.local_fire_department,
+                    color: Colors.redAccent, size: 28),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w800,
+                      fontSize: 18,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildItemPickupOverlay() {
+    final pickup = _latestPickupNotification;
+    if (pickup == null) {
+      return const SizedBox.shrink();
+    }
+    if (DateTime.now().difference(pickup.createdAt) >
+        const Duration(seconds: 5)) {
+      return const SizedBox.shrink();
+    }
+
+    final categoryColor = () {
+      switch (pickup.effectType.category) {
+        case GameItemCategory.healing:
+          return Colors.lightGreenAccent;
+        case GameItemCategory.armor:
+          return Colors.lightBlueAccent;
+        case GameItemCategory.damage:
+          return Colors.orangeAccent;
+        case GameItemCategory.special:
+          return Colors.amberAccent;
+      }
+    }();
+
+    return Positioned(
+      top: 12,
+      left: 12,
+      right: 12,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.84),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: categoryColor, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              children: <Widget>[
+                Icon(Icons.inventory_2, color: categoryColor),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '${pickup.playerName} picked ${pickup.effectType.category.label}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_gunConnected) {
+      final hasSavedGun = _savedGunProfile != null;
       return Scaffold(
         appBar: AppBar(
           title: const Text('Gun Connection'),
           actions: const <Widget>[ThemeToggleButton()],
         ),
         body: SafeArea(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 460),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 460),
+              child: Padding(
+                padding: const EdgeInsets.all(24),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -981,12 +1240,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     const Icon(Icons.bluetooth_searching, size: 44),
                     const SizedBox(height: 12),
                     const Text(
-                      'Connect Your Gun First',
+                      'Connect Gun',
                       textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w700,
-                      ),
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
                     ),
                     const SizedBox(height: 8),
                     Text(
@@ -994,17 +1250,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       textAlign: TextAlign.center,
                       style: const TextStyle(fontSize: 13),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 16),
                     FilledButton.icon(
-                      onPressed: _openGunSettings,
-                      icon: const Icon(Icons.bluetooth_searching, size: 18),
-                      label: const Text('Open Gun Connection'),
+                      onPressed: _isConnectingGun || !hasSavedGun
+                          ? null
+                          : _reconnectGun,
+                      icon: const Icon(Icons.bluetooth_connected, size: 18),
+                      label: Text(
+                        _isConnectingGun
+                            ? 'Connecting...'
+                            : hasSavedGun
+                            ? 'Connect Last Gun'
+                            : 'No Saved Gun',
+                      ),
                     ),
                     const SizedBox(height: 8),
                     OutlinedButton.icon(
-                      onPressed: _reconnectGun,
-                      icon: const Icon(Icons.bluetooth_connected, size: 18),
-                      label: const Text('Reconnect Saved Gun'),
+                      onPressed: _isConnectingGun ? null : _openGunSettings,
+                      icon: const Icon(Icons.manage_search, size: 18),
+                      label: const Text('Find / Pair Gun'),
                     ),
                   ],
                 ),
@@ -1017,6 +1281,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     final snapshot = _snapshot;
     final players = snapshot?.players.values.toList() ?? const <PlayerState>[];
+    final activeEffectsLabel = _localActiveEffectsLabel(snapshot);
     final networkHint = _joinCodeNetworkHint(_joinCodeController.text);
     final brightness = Theme.of(context).brightness;
     final teamPalette = teamPaletteFor(_selectedTeam);
@@ -1057,14 +1322,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
       side: const BorderSide(color: Colors.white70),
     );
     final localPlayer = snapshot?.players[_service.localPlayerId];
+    final hasJoinedLobby = snapshot?.serverPlayerId != null;
+    final isFreeForAll =
+        (snapshot?.lobbyRules.gameType ?? GameType.time) == GameType.freeForAll;
+    final countdownStarted =
+        snapshot?.scheduledGameStartAt != null ||
+        snapshot?.gamePhase == GamePhase.running ||
+        snapshot?.gamePhase == GamePhase.ended;
+    final canChangeTeam =
+        !isFreeForAll && (!hasJoinedLobby || !countdownStarted);
+    final lobbyPlayers = <PlayerState>[...players];
+    if (localPlayer != null &&
+        !lobbyPlayers.any((p) => p.id == _service.localPlayerId)) {
+      lobbyPlayers.insert(0, localPlayer);
+    }
+    final teamBuckets = <String, List<PlayerState>>{};
+    if (isFreeForAll) {
+      teamBuckets['Players'] = lobbyPlayers;
+    } else {
+      for (final team in _teams) {
+        teamBuckets[team] = <PlayerState>[];
+      }
+      for (final player in lobbyPlayers) {
+        teamBuckets.putIfAbsent(player.group, () => <PlayerState>[]).add(player);
+      }
+    }
     final localPlayerName = localPlayer?.name.isNotEmpty == true
         ? localPlayer!.name
         : _nameController.text.trim().isNotEmpty
         ? _nameController.text.trim()
         : 'Player';
+    final hasPlayerName = _nameController.text.trim().isNotEmpty;
     final localGunMode = _savedGunProfile == null
-        ? 'No gun profile'
-        : '${_savedGunProfile!.selectedFireMode.label} • Recoil ${_savedGunProfile!.recoilEnabled ? 'on' : 'off'}';
+      ? 'No gun profile'
+      : '${_savedGunProfile!.selectedFireMode.label} • Recoil ${_savedGunProfile!.recoilEnabled ? 'on' : 'off'}';
     final compactTextTheme = Theme.of(
       context,
     ).textTheme.apply(fontSizeFactor: 0.9);
@@ -1116,40 +1407,99 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: <Widget>[
                                     Text(
-                                      'Lobby players (${players.length})',
+                                      hasJoinedLobby
+                                          ? 'Lobby (${lobbyPlayers.length} players)'
+                                          : 'Lobby preview (${lobbyPlayers.length} players)',
                                       style: Theme.of(
                                         context,
                                       ).textTheme.titleSmall,
                                     ),
                                     const SizedBox(height: 8),
-                                    if (players.isEmpty)
+                                    if (!isFreeForAll)
+                                      DropdownButtonFormField<String>(
+                                        initialValue: _selectedTeam,
+                                        isDense: true,
+                                        decoration: InputDecoration(
+                                          labelText: countdownStarted
+                                              ? 'Team (locked: countdown started)'
+                                              : 'Team selection',
+                                          border: const OutlineInputBorder(),
+                                        ),
+                                        items: _teams
+                                            .map(
+                                              (team) => DropdownMenuItem<String>(
+                                                value: team,
+                                                child: Row(
+                                                  children: <Widget>[
+                                                    _teamIcon(team),
+                                                    const SizedBox(width: 8),
+                                                    Text(team),
+                                                  ],
+                                                ),
+                                              ),
+                                            )
+                                            .toList(),
+                                        onChanged: canChangeTeam
+                                            ? (team) {
+                                                if (team != null) {
+                                                  unawaited(
+                                                    _handleTeamSelectionChanged(
+                                                      team,
+                                                      hasJoinedLobby: hasJoinedLobby,
+                                                    ),
+                                                  );
+                                                }
+                                              }
+                                            : null,
+                                      ),
+                                    const SizedBox(height: 8),
+                                    if (lobbyPlayers.isEmpty)
                                       const Text('No players connected yet.')
                                     else
-                                      ...players.map(
-                                        (player) => Padding(
-                                          padding: const EdgeInsets.only(
-                                            bottom: 4,
-                                          ),
-                                          child: Row(
-                                            children: <Widget>[
-                                              player.isHost
-                                                  ? const Icon(
-                                                      Icons.shield,
-                                                      size: 14,
-                                                    )
-                                                  : const SizedBox.shrink(),
-                                              player.isHost
-                                                  ? const SizedBox(width: 4)
-                                                  : const SizedBox.shrink(),
-                                              Expanded(
-                                                child: Text(
-                                                  '${player.name} • Team ${player.group} • ${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assault'}',
+                                      ...teamBuckets.entries
+                                          .where((entry) => entry.value.isNotEmpty)
+                                          .expand(
+                                            (entry) => <Widget>[
+                                              if (!isFreeForAll)
+                                                Padding(
+                                                  padding: const EdgeInsets.only(
+                                                    top: 6,
+                                                    bottom: 4,
+                                                  ),
+                                                  child: Text(
+                                                    'Team ${entry.key}',
+                                                    style: const TextStyle(
+                                                      fontWeight: FontWeight.w700,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ...entry.value.map(
+                                                (player) => Padding(
+                                                  padding: const EdgeInsets.only(
+                                                    bottom: 4,
+                                                  ),
+                                                  child: Row(
+                                                    children: <Widget>[
+                                                      player.isHost
+                                                          ? const Icon(
+                                                              Icons.shield,
+                                                              size: 14,
+                                                            )
+                                                          : const SizedBox.shrink(),
+                                                      player.isHost
+                                                          ? const SizedBox(width: 4)
+                                                          : const SizedBox.shrink(),
+                                                      Expanded(
+                                                        child: Text(
+                                                          '${player.name} • ${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assault'}',
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
                                                 ),
                                               ),
                                             ],
                                           ),
-                                        ),
-                                      ),
                                   ],
                                 ),
                               ),
@@ -1223,8 +1573,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   ),
                                 ),
                                 const SizedBox(height: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 10,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: textPanelBg,
+                                    border: Border.all(color: textPanelBorder),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    activeEffectsLabel,
+                                    style: TextStyle(color: panelTextColor),
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
                                 TextField(
                                   controller: _nameController,
+                                  onChanged: (_) {
+                                    setState(() {});
+                                  },
                                   decoration: InputDecoration(
                                     isDense: compact,
                                     labelText: 'Player name',
@@ -1255,7 +1626,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                       ),
                                       const SizedBox(height: 4),
                                       Text(
-                                        'Gun mode: $localGunMode',
+                                        hasJoinedLobby
+                                            ? (countdownStarted
+                                                  ? 'Lobby countdown active. Team changes are locked.'
+                                                  : 'Lobby connected. You can still change your team.')
+                                            : 'Enter name and connect to a lobby.',
                                         style: TextStyle(
                                           color: panelSecondaryTextColor,
                                         ),
@@ -1264,144 +1639,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   ),
                                 ),
                                 const SizedBox(height: 8),
-                                Stack(
-                                  children: <Widget>[
-                                    Row(
-                                      children: <Widget>[
-                                        Expanded(
-                                          child: DropdownButtonFormField<String>(
-                                            initialValue: _selectedTeam,
-                                            isDense: compact,
-                                            decoration: const InputDecoration(
-                                              labelText: 'Team',
-                                              border: OutlineInputBorder(),
-                                            ),
-                                            items: _teams
-                                                .map(
-                                                  (team) =>
-                                                      DropdownMenuItem<String>(
-                                                        value: team,
-                                                        child: Row(
-                                                          children: <Widget>[
-                                                            _teamIcon(team),
-                                                            const SizedBox(
-                                                              width: 8,
-                                                            ),
-                                                            Text(team),
-                                                          ],
-                                                        ),
-                                                      ),
-                                                )
-                                                .toList(),
-                                            onChanged: (team) {
-                                              if (team != null) {
-                                                setState(() {
-                                                  _selectedTeam = team;
-                                                });
-                                              }
-                                            },
+                                DropdownButtonFormField<String>(
+                                  initialValue: _selectedTeam,
+                                  isDense: compact,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Team',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  items: _teams
+                                      .map(
+                                        (team) => DropdownMenuItem<String>(
+                                          value: team,
+                                          child: Row(
+                                            children: <Widget>[
+                                              _teamIcon(team),
+                                              const SizedBox(width: 8),
+                                              Text(team),
+                                            ],
                                           ),
                                         ),
-                                        const SizedBox(width: 8),
-                                        Expanded(
-                                          child: FilledButton.icon(
-                                            style:
-                                                teamSecondaryFilledButtonStyle,
-                                            onPressed: _openGunSettings,
-                                            icon: Icon(
-                                              _gunConnected
-                                                  ? Icons.bluetooth_connected
-                                                  : Icons.bluetooth_searching,
-                                            ),
-                                            label: Text(
-                                              _gunConnected
-                                                  ? 'Gun Ready'
-                                                  : 'Gun Settings',
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    _buildGunDisconnectedOverlay(
-                                      overlaySearchButtonStyle,
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: <Widget>[
-                                    Expanded(
-                                      child: OutlinedButton.icon(
-                                        style: teamOutlinedButtonStyle,
-                                        onPressed: _reconnectGun,
-                                        icon: const Icon(
-                                          Icons.bluetooth_connected,
-                                        ),
-                                        label: const Text('Reconnect Gun'),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: <Widget>[
-                                          Text(
-                                            _savedGunProfile == null
-                                                ? 'No saved gun profile'
-                                                : _savedGunProfile!.displayName,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
-                                              color: panelSecondaryTextColor,
-                                              fontWeight: FontWeight.w500,
-                                            ),
-                                          ),
-                                          if (_savedGunProfile !=
-                                              null) ...<Widget>[
-                                            const SizedBox(height: 2),
-                                            Row(
-                                              children: <Widget>[
-                                                Icon(
-                                                  _batteryIconForLevel(
-                                                    _gunBatteryLevel,
-                                                  ),
-                                                  size: 12,
-                                                  color: _batteryColorForLevel(
-                                                    _gunBatteryLevel,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  'Battery: ${_batteryLabelForLevel(_gunBatteryLevel)}',
-                                                  style: TextStyle(
-                                                    fontSize: 12,
-                                                    color:
-                                                        panelSecondaryTextColor,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                            const SizedBox(height: 2),
-                                            Text(
-                                              'Ammo: ${_ammoRemaining ?? '--'} • '
-                                              '${_savedGunProfile!.deviceId} • '
-                                              'Trigger: Shoot • '
-                                              'Reload: Reload • '
-                                              'Thumb/Rear: Fire Mode • '
-                                              'Power: Recoil Toggle • '
-                                              'Fire: ${_savedGunProfile!.selectedFireMode.label} • '
-                                              'Recoil: ${_savedGunProfile!.recoilEnabled ? 'on' : 'off'}',
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                fontSize: 12,
-                                                color: panelSecondaryTextColor,
+                                      )
+                                      .toList(),
+                                  onChanged: canChangeTeam
+                                      ? (team) {
+                                          if (team != null) {
+                                            unawaited(
+                                              _handleTeamSelectionChanged(
+                                                team,
+                                                hasJoinedLobby: hasJoinedLobby,
                                               ),
-                                            ),
-                                          ],
-                                        ],
-                                      ),
-                                    ),
-                                  ],
+                                            );
+                                          }
+                                        }
+                                      : null,
                                 ),
                                 const SizedBox(height: 8),
                                 if (_showJoinCodeFallback) ...<Widget>[
@@ -1454,17 +1724,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                         label: const Text('Search LAN'),
                                       ),
                                     ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: FilledButton.icon(
-                                        style: teamFilledButtonStyle,
-                                        onPressed: _showJoinCodeFallback
-                                            ? _joinLobby
-                                            : null,
-                                        icon: const Icon(Icons.login),
-                                        label: const Text('Join Lobby'),
+                                    if (hasPlayerName) ...<Widget>[
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: FilledButton.icon(
+                                          style: teamFilledButtonStyle,
+                                          onPressed: _showJoinCodeFallback
+                                              ? _joinLobby
+                                              : null,
+                                          icon: const Icon(Icons.login),
+                                          label: const Text('Join Lobby'),
+                                        ),
                                       ),
-                                    ),
+                                    ],
                                   ],
                                 ),
                                 const SizedBox(height: 8),
@@ -1515,6 +1787,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
           ),
+          _buildItemPickupOverlay(),
+          _buildGunDisconnectedOverlay(overlaySearchButtonStyle),
+          _buildKillOverlay(),
         ],
       ),
     );

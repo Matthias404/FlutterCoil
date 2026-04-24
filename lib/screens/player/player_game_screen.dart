@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:audioplayers/audioplayers.dart';
+import 'package:audioplayers/audioplayers.dart' hide PlayerState;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -11,9 +11,15 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../media_confic.dart';
+import '../../network/game_network_service.dart';
+import '../../network/item_definitions.dart';
+import '../../network/item_models.dart';
+import '../../network/player_state.dart';
 import '../../screens/player/gun_settings_screen.dart';
+import '../../screens/player/player_results_screen.dart';
 import '../../theme/team_colors.dart';
 import '../../theme/theme_toggle_button.dart';
 import '../../utils/ble_gun_controller.dart';
@@ -22,72 +28,68 @@ import '../../utils/helpers.dart'
     show ensureMicrophonePermission, teamBackgroundColors;
 import '../../utils/offline_map_cache.dart';
 
-class PlayerGameTestScreen extends StatefulWidget {
-  const PlayerGameTestScreen({super.key});
+class PlayerGameScreen extends StatefulWidget {
+  const PlayerGameScreen({super.key, required this.service});
+
+  final GameNetworkService service;
 
   @override
-  State<PlayerGameTestScreen> createState() => _PlayerGameTestScreenState();
+  State<PlayerGameScreen> createState() => _PlayerGameScreenState();
 }
 
-class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
-  static const int _maxLives = 10;
+class _PlayerGameScreenState extends State<PlayerGameScreen> {
   static const int _startingAmmo = 15;
   static const Duration _reloadTelemetrySyncWindow = Duration(seconds: 2);
   static const int _burst3ShotsPerTriggerPress = 3;
   static const int _autoShotsPerTriggerPress = 1;
   static const Duration _burstShotInterval = Duration(milliseconds: 90);
   static const Duration _autoShotInterval = Duration(milliseconds: 70);
+  static const Duration _autoReconnectCooldown = Duration(seconds: 2);
   static const int _recoilTriggerButtonBit = 0x01;
-  static const int _matchLengthSeconds = 300;
   static const double _radarRangeMeters = 80;
-  static const double _itemPickupRadiusMeters = 1;
-  static const double _itemMinPairDistanceMeters = 10;
-  static const double _itemFallbackSpawnDistanceMeters = 10;
-  static const int _maxSpawnedItems = 8;
-  static const int _itemSpawnIntervalSeconds = 6;
-  static const double _playerLatitude = 48.137154;
-  static const double _playerLongitude = 11.576124;
 
   Timer? _matchTimer;
   Timer? _reloadTimer;
   Timer? _autoFireTimer;
-  int _timeRemaining = _matchLengthSeconds;
-  int _livesLeft = _maxLives;
+  Timer? _itemOverlayTimer;
+  Timer? _autoReconnectTimer;
+  int _timeRemaining = 0;
+  int _livesLeft = 10;
   int _ammoLeft = _startingAmmo;
-  int _score = 0;
-  int _hitsTaken = 0;
-  int _shotsFired = 0;
   bool _isGameRunning = true;
   bool _isReloading = false;
   bool _isFiringSequence = false;
   bool _isTriggerHeld = false;
-  String _eventText = 'Match started. Good luck, player!';
-  final String _playerName = 'Player One';
-  final String _team = 'Red Team';
   String _fireType = 'Burst';
   String _role = 'Assult';
   bool _shieldActive = false;
-  bool _healingBoostActive = false;
+  bool _canUsePlayerHeal = false;
+  DateTime? _shieldExpiresAt;
+  DateTime? _noReloadExpiresAt;
+  DateTime? _doubleDamageExpiresAt;
+  DateTime? _invisibilityExpiresAt;
+  _ItemPickupOverlay? _activePickupOverlay;
+  _PendingAirStrike? _pendingAirStrike;
+  Timer? _killOverlayTimer;
+  String? _killOverlayMessage;
+  String? _lastPickupNotificationId;
   double _radarSweepDegrees = 0;
   int _tick = 0;
-  final math.Random _random = math.Random();
-  List<_RadarContact> _contacts = <_RadarContact>[
-    const _RadarContact(id: 'P2', team: 'Blue Team', xMeters: 24, yMeters: -10),
-    const _RadarContact(
-      id: 'P3',
-      team: 'Green Team',
-      xMeters: -18,
-      yMeters: 32,
-    ),
-    const _RadarContact(id: 'P4', team: 'Yellow Team', xMeters: 45, yMeters: 8),
-    const _RadarContact(id: 'P5', team: 'Red Team', xMeters: -35, yMeters: -22),
-  ];
-  List<_MapItem> _items = <_MapItem>[];
+  NetworkSnapshot? _snapshot;
+  StreamSubscription<NetworkSnapshot>? _snapshotSub;
+  StreamSubscription<KillEvent>? _killEventSub;
+  StreamSubscription<TeamVoiceMessage>? _teamVoiceSub;
   late final AudioRecorder _teamVoiceRecorder;
   late final AudioPlayer _teamVoicePlayer;
   late final AudioPlayer _gunSfxPlayer;
+  final List<AudioPlayer> _shotSfxPlayers = List<AudioPlayer>.generate(
+    4,
+    (_) => AudioPlayer(),
+  );
+  int _shotSfxPlayerIndex = 0;
   String _gunShotAssetPath = MediaConfic.laserShot;
   String? _reloadSoundAssetPath;
+  String? _healSoundAssetPath;
   Timer? _gunSfxCutoffTimer;
   bool _isRecordingTeamVoice = false;
   String _teamVoiceStatus = 'Team voice ready.';
@@ -102,11 +104,42 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   GunBatteryLevel? _gunBatteryLevel;
   bool _gunConnected = false;
   bool _showGunDisconnectedAlert = false;
+  bool _didNavigateToResults = false;
   int? _lastTriggerCounter;
   int? _lastReloadCounter;
   int? _lastStartCounter;
+  int? _lastRecoilPlayerIdReported;
   int? _lastHitBy1Key;
   int? _lastHitBy2Key;
+
+  void _navigateToResultsIfNeeded([NetworkSnapshot? snapshot]) {
+    if (!mounted || _didNavigateToResults) {
+      return;
+    }
+
+    final finalSnapshot = snapshot ?? _snapshot ?? widget.service.snapshot;
+    final players = finalSnapshot.players.values.toList();
+    if (players.isEmpty) {
+      return;
+    }
+
+    _didNavigateToResults = true;
+    _matchTimer?.cancel();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(
+          builder: (_) => PlayerResultsScreen(
+            players: players,
+            localPlayerId: widget.service.localPlayerId,
+          ),
+        ),
+      );
+    });
+  }
 
   IconData _batteryIconForLevel(GunBatteryLevel? level) {
     switch (level) {
@@ -162,13 +195,28 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
 
   Future<void> _playGunShotSound() async {
     try {
-      await _playActionSound(
-        _gunShotAssetPath,
-        cutoff: const Duration(milliseconds: 640),
-      );
+      final player = _shotSfxPlayers[_shotSfxPlayerIndex];
+      _shotSfxPlayerIndex = (_shotSfxPlayerIndex + 1) % _shotSfxPlayers.length;
+      await player.stop();
+      await player.play(AssetSource(_gunShotAssetPath), volume: 1.0);
     } catch (_) {
       // Keep gameplay running if audio fails.
     }
+  }
+
+  Future<void> _playItemUseSound(GameItemEffectType effectType) async {
+    final sound = ItemRegistry.of(effectType)?.useSound;
+    await _playOptionalActionSound(sound);
+  }
+
+  void _showKillOverlay(String message) {
+    setState(() => _killOverlayMessage = message);
+    _killOverlayTimer?.cancel();
+    _killOverlayTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) {
+        setState(() => _killOverlayMessage = null);
+      }
+    });
   }
 
   Future<void> _playReloadSound() async {
@@ -227,20 +275,41 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   @override
   void initState() {
     super.initState();
+    unawaited(WakelockPlus.enable());
     _teamVoiceRecorder = AudioRecorder();
     _teamVoicePlayer = AudioPlayer();
     _gunSfxPlayer = AudioPlayer();
     unawaited(_resolveGunActionAudioAssets());
     unawaited(_loadSavedGunProfile());
     unawaited(_initializeGpsTracking());
+
+    // Initialise timer length from server rules.
+    final rules = widget.service.snapshot.lobbyRules;
+    _timeRemaining = rules.matchLengthMinutes * 60;
+    _livesLeft = rules.maxLives;
+    _snapshot = widget.service.snapshot;
+
+    _snapshotSub = widget.service.updates.listen(_onSnapshotUpdate);
+    _killEventSub = widget.service.killEvents.listen(_onKillEvent);
+    _teamVoiceSub = widget.service.teamVoiceMessages.listen(
+      _onTeamVoiceReceived,
+    );
+
     _startTimer();
   }
 
   @override
   void dispose() {
+    unawaited(WakelockPlus.disable());
     _matchTimer?.cancel();
     _reloadTimer?.cancel();
     _autoFireTimer?.cancel();
+    _itemOverlayTimer?.cancel();
+    _killOverlayTimer?.cancel();
+    _autoReconnectTimer?.cancel();
+    _snapshotSub?.cancel();
+    _killEventSub?.cancel();
+    _teamVoiceSub?.cancel();
     unawaited(_positionSubscription?.cancel());
     _gunConnectionSub?.cancel();
     _gunBatterySub?.cancel();
@@ -249,6 +318,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     unawaited(_teamVoiceRecorder.dispose());
     unawaited(_teamVoicePlayer.dispose());
     unawaited(_gunSfxPlayer.dispose());
+    for (final player in _shotSfxPlayers) {
+      unawaited(player.dispose());
+    }
     super.dispose();
   }
 
@@ -272,7 +344,223 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     if (gunConnected) {
       await _startBatteryMonitoring(profile);
       await _startTelemetryMonitoring(profile);
+      await _applyShotModeToGun(profile);
+      await _applyRecoilModeToGun(profile);
+      await _armGunForMatch(profile);
+    } else {
+      _scheduleAutoReconnect();
     }
+  }
+
+  Future<void> _armGunForMatch(GunProfile profile) async {
+    if (!_gunConnected) {
+      return;
+    }
+
+    final recoilPlayerId =
+        widget.service.localRecoilPlayerId ??
+        widget.service.preferredRecoilPlayerId;
+    try {
+      await BleGunController.setPlayerId(
+        deviceId: profile.deviceId,
+        playerId: recoilPlayerId,
+      );
+      await BleGunController.reloadAmmo(
+        deviceId: profile.deviceId,
+        playerId: recoilPlayerId,
+        shotCount: _startingAmmo,
+      );
+      await widget.service.updateLocalRecoilPlayerId(recoilPlayerId);
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+    }
+  }
+
+  void _onSnapshotUpdate(NetworkSnapshot snapshot) {
+    if (!mounted) {
+      return;
+    }
+    final local = snapshot.players[widget.service.localPlayerId];
+    final rules = snapshot.lobbyRules;
+    final maxLives = rules.maxLives;
+    setState(() {
+      _snapshot = snapshot;
+      if (snapshot.gamePhase == GamePhase.running) {
+        _isGameRunning = true;
+      }
+      if (local != null) {
+        _livesLeft = (maxLives - local.hitsTaken).clamp(0, maxLives);
+        if (_livesLeft == 0 && _isGameRunning) {
+          _isGameRunning = false;
+          _clearOnDeathEffects();
+        }
+      }
+      if (snapshot.gamePhase == GamePhase.ended && _isGameRunning) {
+        _isGameRunning = false;
+      }
+    });
+
+    if (snapshot.gamePhase == GamePhase.ended) {
+      _navigateToResultsIfNeeded(snapshot);
+    }
+
+    _syncPickupOverlay(snapshot);
+    _syncAirStrikeWarningOverlay(snapshot);
+
+    // Detect new active effects for local player and apply sound/state.
+    if (local != null) {
+      for (final effect in snapshot.activeEffects) {
+        if (effect.playerId != widget.service.localPlayerId) {
+          continue;
+        }
+        _applyNetworkEffect(effect);
+      }
+    }
+  }
+
+  void _applyNetworkEffect(ActiveGameEffect effect) {
+    switch (effect.effectType) {
+      case GameItemEffectType.playerShield:
+      case GameItemEffectType.teamArmor:
+        if (!_shieldActive) {
+          _shieldActive = true;
+          _shieldExpiresAt = effect.expiresAt;
+        }
+      case GameItemEffectType.playerHeal:
+        _canUsePlayerHeal = true;
+      case GameItemEffectType.teamAmmo:
+      case GameItemEffectType.playerAmmo:
+        if (_noReloadExpiresAt == null ||
+            DateTime.now().isAfter(_noReloadExpiresAt!)) {
+          _noReloadExpiresAt = effect.expiresAt;
+          if (_noReloadExpiresAt != null) {
+            _ammoLeft = _startingAmmo;
+          }
+        }
+      case GameItemEffectType.doubleDamage:
+        _doubleDamageExpiresAt = effect.expiresAt;
+      case GameItemEffectType.invisibility:
+        _invisibilityExpiresAt = effect.expiresAt;
+      case GameItemEffectType.airStrike:
+        // Resolved server-side.
+        break;
+      case GameItemEffectType.teamHeal:
+        // Applied server-side; nothing local to update.
+        break;
+    }
+  }
+
+  void _onKillEvent(KillEvent kill) {
+    if (!mounted) {
+      return;
+    }
+    if (kill.victimPlayerId == widget.service.localPlayerId) {
+      _showKillOverlay('Killed by ${kill.killerName}');
+    } else if (kill.killerPlayerId == widget.service.localPlayerId) {
+      _showKillOverlay('You eliminated ${kill.victimName}!');
+    }
+  }
+
+  void _syncPickupOverlay(NetworkSnapshot snapshot) {
+    final pickups = snapshot.recentItemPickups;
+    if (pickups.isEmpty) {
+      return;
+    }
+    final latest = pickups.last;
+    if (latest.id == _lastPickupNotificationId) {
+      return;
+    }
+
+    final definition = ItemRegistry.of(latest.effectType);
+    _lastPickupNotificationId = latest.id;
+    _itemOverlayTimer?.cancel();
+    setState(() {
+      _activePickupOverlay = _ItemPickupOverlay(
+        collectorId: latest.playerName,
+        category: latest.effectType.category,
+        subcategoryLabel: definition?.name ?? latest.effectType.label,
+        showUntil: DateTime.now().add(const Duration(seconds: 2)),
+      );
+    });
+
+    _itemOverlayTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _activePickupOverlay = null;
+      });
+    });
+  }
+
+  void _syncAirStrikeWarningOverlay(NetworkSnapshot snapshot) {
+    final strikeEffect = snapshot.activeEffects
+        .where((effect) => effect.effectType == GameItemEffectType.airStrike)
+        .cast<ActiveGameEffect?>()
+        .firstWhere((_) => true, orElse: () => null);
+
+    if (strikeEffect == null || strikeEffect.expiresAt == null) {
+      if (_pendingAirStrike != null) {
+        setState(() {
+          _pendingAirStrike = null;
+        });
+      }
+      return;
+    }
+
+    final targetName =
+      snapshot.players[strikeEffect.playerId]?.name ?? 'Player';
+    final next = _PendingAirStrike(
+      targetId: targetName,
+      resolveAt: strikeEffect.expiresAt!,
+    );
+
+    if (_pendingAirStrike?.targetId != next.targetId ||
+        _pendingAirStrike?.resolveAt != next.resolveAt) {
+      setState(() {
+        _pendingAirStrike = next;
+      });
+    }
+  }
+
+  Future<void> _onTeamVoiceReceived(TeamVoiceMessage message) async {
+    if (!mounted) {
+      return;
+    }
+    try {
+      final audioBytes = base64Decode(message.audioBase64);
+      if (audioBytes.isEmpty) {
+        return;
+      }
+      await _teamVoicePlayer.play(BytesSource(audioBytes));
+      if (mounted) {
+        setState(() {
+          _teamVoiceStatus =
+              'Voice from ${message.senderName} (${message.team}) played.';
+        });
+      }
+    } catch (_) {
+      // Ignore playback errors.
+    }
+  }
+
+  void _scheduleAutoReconnect() {
+    final profile = _savedGunProfile;
+    if (!mounted || profile == null || _gunConnected) {
+      return;
+    }
+    if (_autoReconnectTimer?.isActive == true) {
+      return;
+    }
+
+    _autoReconnectTimer = Timer(_autoReconnectCooldown, () {
+      if (!mounted || _gunConnected) {
+        return;
+      }
+      unawaited(_reconnectGun());
+    });
   }
 
   Future<void> _startGunConnectionMonitoring(GunProfile profile) async {
@@ -286,19 +574,21 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
           }
 
           if (connected) {
-            if (!_gunConnected || _showGunDisconnectedAlert) {
+            if (!_gunConnected) {
               setState(() {
                 _gunConnected = true;
                 _showGunDisconnectedAlert = false;
-                _eventText = 'Gun connected: ${profile.displayName}.';
               });
               unawaited(_startBatteryMonitoring(profile));
               unawaited(_startTelemetryMonitoring(profile));
+              unawaited(_applyShotModeToGun(profile));
+              unawaited(_applyRecoilModeToGun(profile));
+              unawaited(_armGunForMatch(profile));
             }
             return;
           }
 
-          if (_gunConnected || !_showGunDisconnectedAlert) {
+          if (_gunConnected) {
             setState(() {
               _gunConnected = false;
               _showGunDisconnectedAlert = true;
@@ -306,10 +596,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
               _lastTriggerCounter = null;
               _lastReloadCounter = null;
               _lastStartCounter = null;
-              _eventText =
-                  'Gun disconnected. Check Bluetooth range and reconnect it.';
             });
             unawaited(_gunTelemetrySub?.cancel());
+            _scheduleAutoReconnect();
           }
         });
   }
@@ -342,6 +631,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     _lastTriggerCounter = null;
     _lastReloadCounter = null;
     _lastStartCounter = null;
+    _lastRecoilPlayerIdReported = null;
     _lastHitBy1Key = null;
     _lastHitBy2Key = null;
 
@@ -351,6 +641,14 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         ) {
           if (!mounted) {
             return;
+          }
+
+          if (sample.recoilPlayerId > 0 &&
+              sample.recoilPlayerId != _lastRecoilPlayerIdReported) {
+            _lastRecoilPlayerIdReported = sample.recoilPlayerId;
+            unawaited(
+              widget.service.updateLocalRecoilPlayerId(sample.recoilPlayerId),
+            );
           }
 
           final triggerHeldNow =
@@ -382,13 +680,13 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
           final hitBy1Key = (sample.hitBy1 << 3) | sample.hitBy1ShotId;
           if (sample.hitBy1 > 0 && hitBy1Key != _lastHitBy1Key) {
             _lastHitBy1Key = hitBy1Key;
-            _onHitFromGun(sample.hitBy1);
+            unawaited(_onHitFromGun(sample.hitBy1));
           }
 
           final hitBy2Key = (sample.hitBy2 << 3) | sample.hitBy2ShotId;
           if (sample.hitBy2 > 0 && hitBy2Key != _lastHitBy2Key) {
             _lastHitBy2Key = hitBy2Key;
-            _onHitFromGun(sample.hitBy2);
+            unawaited(_onHitFromGun(sample.hitBy2));
           }
 
           // Keep ammo accounting local in test mode so rounds are consumed only
@@ -421,12 +719,16 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   }
 
   bool _fireSingleShot() {
-    if (_isReloading || _ammoLeft <= 0) {
+    final hasUnlimitedAmmo =
+        _noReloadExpiresAt != null &&
+        DateTime.now().isBefore(_noReloadExpiresAt!);
+    if (_isReloading || (!hasUnlimitedAmmo && _ammoLeft <= 0)) {
       return false;
     }
 
-    _ammoLeft -= 1;
-    _shotsFired += 1;
+    if (!hasUnlimitedAmmo) {
+      _ammoLeft -= 1;
+    }
     return true;
   }
 
@@ -435,10 +737,10 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       return;
     }
 
-    if (_ammoLeft <= 0) {
-      setState(() {
-        _eventText = 'Trigger pressed: Empty magazine.';
-      });
+    final hasUnlimitedAmmo =
+        _noReloadExpiresAt != null &&
+        DateTime.now().isBefore(_noReloadExpiresAt!);
+    if (!hasUnlimitedAmmo && _ammoLeft <= 0) {
       return;
     }
 
@@ -484,6 +786,10 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         }
 
         firedShots += 1;
+        final profile = _savedGunProfile;
+        if (profile != null && _gunConnected) {
+          unawaited(BleGunController.pulseRecoil(deviceId: profile.deviceId));
+        }
         unawaited(_playGunShotSound());
         if (i < shotsToFire - 1 && spacing > Duration.zero) {
           await Future<void>.delayed(spacing);
@@ -497,37 +803,32 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       return;
     }
 
-    setState(() {
-      if (firedShots == 0) {
-        _eventText = 'Trigger pressed: Empty magazine.';
-      } else {
-        _eventText =
-            'Trigger pressed: $modeLabel fired $firedShots shot${firedShots == 1 ? '' : 's'}.';
-      }
-    });
   }
 
-  void _onHitFromGun(int shooterId) {
+  Future<void> _onHitFromGun(int shooterId) async {
+    if (!mounted) {
+      return;
+    }
+
+    if (_shieldActive &&
+        _shieldExpiresAt != null &&
+        DateTime.now().isBefore(_shieldExpiresAt!)) {
+      return;
+    }
+
+    final registered = await widget.service.registerTelemetryHit(shooterId);
+
     if (!mounted) {
       return;
     }
 
     setState(() {
-      _hitsTaken += 1;
-      if (_shieldActive) {
-        _shieldActive = false;
-        _eventText = 'Hit from player $shooterId blocked by shield.';
+      if (!registered) {
         return;
       }
 
-      _livesLeft = (_livesLeft - 1).clamp(0, _maxLives);
-      if (_livesLeft == 0) {
-        _isGameRunning = false;
-        _eventText = 'You were hit by player $shooterId and eliminated.';
-      } else {
-        _eventText =
-            'Hit from player $shooterId. Lives: $_livesLeft/$_maxLives.';
-      }
+      _shieldActive = false;
+      _shieldExpiresAt = null;
     });
   }
 
@@ -541,10 +842,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText =
-            'Gun connected, but recoil command failed. Try reconnecting the gun.';
-      });
     }
   }
 
@@ -558,10 +855,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText =
-            'Gun connected, but fire mode command failed. Try reconnecting the gun.';
-      });
     }
   }
 
@@ -571,9 +864,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       return;
     }
 
-    setState(() {
-      _eventText = 'Reconnecting gun ${profile.displayName}...';
-    });
+    _autoReconnectTimer?.cancel();
 
     try {
       await BleGunController.connect(deviceId: profile.deviceId);
@@ -585,7 +876,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         _savedGunProfile = profile;
         _gunConnected = true;
         _showGunDisconnectedAlert = false;
-        _eventText = 'Gun reconnected: ${profile.displayName}.';
       });
 
       await _startGunConnectionMonitoring(profile);
@@ -593,6 +883,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       await _startTelemetryMonitoring(profile);
       await _applyShotModeToGun(profile);
       await _applyRecoilModeToGun(profile);
+      await _armGunForMatch(profile);
     } catch (_) {
       if (!mounted) {
         return;
@@ -602,27 +893,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         _savedGunProfile = profile;
         _gunConnected = false;
         _showGunDisconnectedAlert = true;
-        _eventText = 'Could not reconnect gun. Check Bluetooth and try again.';
       });
+      _scheduleAutoReconnect();
     }
-  }
-
-  Future<void> _openGunSettings() async {
-    final profile = await Navigator.of(context).push<GunProfile>(
-      MaterialPageRoute<GunProfile>(
-        builder: (_) => GunSettingsScreen(initialProfile: _savedGunProfile),
-      ),
-    );
-    if (!mounted || profile == null) {
-      return;
-    }
-
-    await GunProfileStorage.save(profile);
-    setState(() {
-      _savedGunProfile = profile;
-      _syncFireTypeFromProfile(profile);
-    });
-    await _reconnectGun();
   }
 
   Widget _buildGunDisconnectedOverlay(ButtonStyle searchButtonStyle) {
@@ -696,6 +969,24 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     );
   }
 
+  Future<void> _openGunSettings() async {
+    final profile = await Navigator.of(context).push<GunProfile>(
+      MaterialPageRoute<GunProfile>(
+        builder: (_) => GunSettingsScreen(initialProfile: _savedGunProfile),
+      ),
+    );
+    if (!mounted || profile == null) {
+      return;
+    }
+
+    await GunProfileStorage.save(profile);
+    setState(() {
+      _savedGunProfile = profile;
+      _syncFireTypeFromProfile(profile);
+    });
+    await _reconnectGun();
+  }
+
   Future<void> _toggleTeamVoiceRecording() async {
     if (_isRecordingTeamVoice) {
       await _stopAndPlayTeamVoice();
@@ -765,14 +1056,18 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     }
 
     final encoded = base64Encode(bytes);
-    await _teamVoicePlayer.play(BytesSource(base64Decode(encoded)));
+    await widget.service.sendTeamVoiceMessage(
+      audioBase64: encoded,
+      mimeType: 'audio/mp4',
+      durationMs: 0,
+    );
 
     if (!mounted) {
       return;
     }
 
     setState(() {
-      _teamVoiceStatus = 'Team voice clip sent and played back (simulation).';
+      _teamVoiceStatus = 'Voice message sent to the lobby.';
     });
   }
 
@@ -813,6 +1108,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
             'GPS: ${current.latitude.toStringAsFixed(5)}, ${current.longitude.toStringAsFixed(5)}';
       });
       _mapController.move(livePosition, 18);
+      unawaited(
+        widget.service.updateGpsPosition(current.latitude, current.longitude),
+      );
     }
 
     _positionSubscription =
@@ -820,6 +1118,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
           locationSettings: const LocationSettings(
             accuracy: LocationAccuracy.high,
             distanceFilter: 2,
+            timeLimit: Duration(milliseconds: 1500),
           ),
         ).listen((position) {
           if (!mounted) {
@@ -833,6 +1132,12 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                 'GPS: ${position.latitude.toStringAsFixed(5)}, ${position.longitude.toStringAsFixed(5)}';
           });
           _mapController.move(livePosition, 18);
+          unawaited(
+            widget.service.updateGpsPosition(
+              position.latitude,
+              position.longitude,
+            ),
+          );
         });
   }
 
@@ -844,22 +1149,30 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         return;
       }
 
-      if (!_isGameRunning) {
-        return;
-      }
-
       _tick += 1;
       _radarSweepDegrees = (_radarSweepDegrees + 18) % 360;
-      _animateContacts();
-      _spawnRandomItemIfNeeded();
-      _collectNearbyItems();
+      _tickEffectTimers();
+
+      // Stop the local countdown when the server ends the game.
+      final serverPhase = _snapshot?.gamePhase;
+      if (serverPhase == GamePhase.ended) {
+        if (_isGameRunning) {
+          setState(() {
+            _timeRemaining = 0;
+            _isGameRunning = false;
+          });
+        }
+        _navigateToResultsIfNeeded();
+        timer.cancel();
+        return;
+      }
 
       if (_timeRemaining <= 1) {
         setState(() {
           _timeRemaining = 0;
           _isGameRunning = false;
-          _eventText = 'Match ended. Time is up!';
         });
+        _navigateToResultsIfNeeded();
         timer.cancel();
         return;
       }
@@ -870,222 +1183,48 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     });
   }
 
-  void _animateContacts() {
-    _contacts = _contacts.asMap().entries.map((entry) {
-      final index = entry.key;
-      final contact = entry.value;
-      final driftX = math.sin((_tick + index * 11) / 4) * 1.8;
-      final driftY = math.cos((_tick + index * 7) / 4) * 1.8;
-      final nextX = (contact.xMeters + driftX).clamp(
-        -_radarRangeMeters,
-        _radarRangeMeters,
-      );
-      final nextY = (contact.yMeters + driftY).clamp(
-        -_radarRangeMeters,
-        _radarRangeMeters,
-      );
-      return _RadarContact(
-        id: contact.id,
-        team: contact.team,
-        xMeters: nextX,
-        yMeters: nextY,
-      );
-    }).toList();
-  }
-
-  void _spawnRandomItemIfNeeded() {
-    if (!_isGameRunning) {
-      return;
+  void _tickEffectTimers() {
+    final now = DateTime.now();
+    if (_shieldExpiresAt != null && now.isAfter(_shieldExpiresAt!)) {
+      _shieldExpiresAt = null;
+      _shieldActive = false;
     }
-    if (_tick % _itemSpawnIntervalSeconds != 0) {
-      return;
+    if (_noReloadExpiresAt != null && now.isAfter(_noReloadExpiresAt!)) {
+      _noReloadExpiresAt = null;
     }
-    if (_items.length >= _maxSpawnedItems) {
-      return;
+    if (_doubleDamageExpiresAt != null &&
+        now.isAfter(_doubleDamageExpiresAt!)) {
+      _doubleDamageExpiresAt = null;
     }
-
-    final players = _allSimulatedPlayers();
-    if (players.isEmpty) {
-      return;
-    }
-
-    final pair = _randomPlayerPairAtLeastDistance(
-      players,
-      _itemMinPairDistanceMeters,
-    );
-
-    late final double spawnX;
-    late final double spawnY;
-
-    if (pair != null) {
-      spawnX = (pair.$1.xMeters + pair.$2.xMeters) / 2;
-      spawnY = (pair.$1.yMeters + pair.$2.yMeters) / 2;
-    } else {
-      final anchor = players[_random.nextInt(players.length)];
-      final angle = _random.nextDouble() * 2 * math.pi;
-      spawnX =
-          anchor.xMeters + math.cos(angle) * _itemFallbackSpawnDistanceMeters;
-      spawnY =
-          anchor.yMeters + math.sin(angle) * _itemFallbackSpawnDistanceMeters;
-    }
-
-    final category =
-        _ItemCategory.values[_random.nextInt(_ItemCategory.values.length)];
-
-    _items = <_MapItem>[
-      ..._items,
-      _MapItem(
-        id: 'item_${_tick}_${_random.nextInt(1 << 20)}',
-        category: category,
-        xMeters: spawnX.clamp(-_radarRangeMeters, _radarRangeMeters),
-        yMeters: spawnY.clamp(-_radarRangeMeters, _radarRangeMeters),
-      ),
-    ];
-    _eventText = 'Spawned ${_itemCategoryLabel(category)} item.';
-  }
-
-  void _collectNearbyItems() {
-    if (_items.isEmpty) {
-      return;
-    }
-
-    final players = _allSimulatedPlayers();
-    final remaining = <_MapItem>[];
-    String? latestPickupText;
-
-    for (final item in _items) {
-      final collector = _nearestCollectorWithinRadius(item, players);
-      if (collector == null) {
-        remaining.add(item);
-        continue;
-      }
-
-      if (collector.id == _playerName) {
-        _applyItemToLocalPlayer(item.category);
-      }
-
-      latestPickupText =
-          '${collector.id} picked ${_itemCategoryLabel(item.category)} item.';
-    }
-
-    _items = remaining;
-    if (latestPickupText != null) {
-      _eventText = latestPickupText;
+    if (_invisibilityExpiresAt != null &&
+        now.isAfter(_invisibilityExpiresAt!)) {
+      _invisibilityExpiresAt = null;
     }
   }
 
-  void _applyItemToLocalPlayer(_ItemCategory category) {
-    switch (category) {
-      case _ItemCategory.healing:
-        _livesLeft = (_livesLeft + 2).clamp(0, _maxLives);
-      case _ItemCategory.armor:
-        _shieldActive = true;
-      case _ItemCategory.damage:
-        _ammoLeft = (_ammoLeft + 8).clamp(0, _startingAmmo);
-        _score += 25;
-      case _ItemCategory.special:
-        _score += 150;
-        _healingBoostActive = true;
-    }
-  }
-
-  _SimulatedPlayer? _nearestCollectorWithinRadius(
-    _MapItem item,
-    List<_SimulatedPlayer> players,
-  ) {
-    _SimulatedPlayer? nearest;
-    var nearestDistance = double.infinity;
-
-    for (final player in players) {
-      final distance = _distanceMeters(
-        item.xMeters,
-        item.yMeters,
-        player.xMeters,
-        player.yMeters,
-      );
-      if (distance <= _itemPickupRadiusMeters && distance < nearestDistance) {
-        nearest = player;
-        nearestDistance = distance;
-      }
-    }
-
-    return nearest;
-  }
-
-  List<_SimulatedPlayer> _allSimulatedPlayers() {
-    return <_SimulatedPlayer>[
-      const _SimulatedPlayer(
-        id: 'Player One',
-        team: 'Red Team',
-        xMeters: 0,
-        yMeters: 0,
-      ),
-      ..._contacts.map(
-        (contact) => _SimulatedPlayer(
-          id: contact.id,
-          team: contact.team,
-          xMeters: contact.xMeters,
-          yMeters: contact.yMeters,
-        ),
-      ),
-    ];
-  }
-
-  (_SimulatedPlayer, _SimulatedPlayer)? _randomPlayerPairAtLeastDistance(
-    List<_SimulatedPlayer> players,
-    double minDistance,
-  ) {
-    if (players.length < 2) {
-      return null;
-    }
-
-    final validPairs = <(_SimulatedPlayer, _SimulatedPlayer)>[];
-    for (var i = 0; i < players.length - 1; i++) {
-      for (var j = i + 1; j < players.length; j++) {
-        final first = players[i];
-        final second = players[j];
-        final distance = _distanceMeters(
-          first.xMeters,
-          first.yMeters,
-          second.xMeters,
-          second.yMeters,
-        );
-        if (distance >= minDistance) {
-          validPairs.add((first, second));
-        }
-      }
-    }
-
-    if (validPairs.isEmpty) {
-      return null;
-    }
-    return validPairs[_random.nextInt(validPairs.length)];
-  }
-
-  void _toggleShieldBonus() {
-    setState(() {
-      _shieldActive = !_shieldActive;
-      _eventText = _shieldActive
-          ? 'Shield bonus enabled.'
-          : 'Shield bonus disabled.';
-    });
+  void _clearOnDeathEffects() {
+    _shieldActive = false;
+    _shieldExpiresAt = null;
+    _noReloadExpiresAt = null;
+    _doubleDamageExpiresAt = null;
+    _invisibilityExpiresAt = null;
+    _canUsePlayerHeal = false;
   }
 
   void _toggleHealingBonus() {
     setState(() {
-      _healingBoostActive = !_healingBoostActive;
-      _eventText = _healingBoostActive
-          ? 'Healing bonus enabled.'
-          : 'Healing bonus disabled.';
+      if (_canUsePlayerHeal) {
+        final maxLives = _snapshot?.lobbyRules.maxLives ?? 10;
+        _livesLeft = maxLives;
+        _canUsePlayerHeal = false;
+        unawaited(_playItemUseSound(GameItemEffectType.playerHeal));
+      }
     });
   }
 
   void _cycleFireType() {
     final profile = _savedGunProfile;
     if (profile == null) {
-      setState(() {
-        _eventText = 'Open Gun Settings first to configure the gun profile.';
-      });
       return;
     }
     unawaited(_handleGunButtonPress(GunButton.thumb));
@@ -1097,9 +1236,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText = 'Open Gun Settings first to configure the gun profile.';
-      });
       return;
     }
 
@@ -1118,9 +1254,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText = 'No fire modes are allowed in the current profile.';
-      });
       return;
     }
 
@@ -1137,8 +1270,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     setState(() {
       _savedGunProfile = updatedProfile;
       _syncFireTypeFromProfile(updatedProfile);
-      _eventText =
-          'Fire mode switched to ${_displayFireType(nextMode)} via Start Button.';
     });
 
     if (updatedProfile.selectedFireMode == FireMode.auto && _isTriggerHeld) {
@@ -1158,10 +1289,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText =
-            '${button.label} pressed (simulated). Open Gun Settings to map controls.';
-      });
       return;
     }
 
@@ -1181,9 +1308,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
 
     if (button == GunButton.trigger) {
       if (_isReloading) {
-        setState(() {
-          _eventText = '${button.label} pressed: Reload in progress.';
-        });
         return;
       }
 
@@ -1192,10 +1316,15 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     }
 
     if (button == GunButton.reload) {
-      if (_isReloading) {
+      if (_noReloadExpiresAt != null &&
+          DateTime.now().isBefore(_noReloadExpiresAt!)) {
         setState(() {
-          _eventText = '${button.label} pressed: Already reloading.';
+          _ammoLeft = _startingAmmo;
         });
+        return;
+      }
+
+      if (_isReloading) {
         return;
       }
 
@@ -1204,7 +1333,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
 
       setState(() {
         _isReloading = true;
-        _eventText = '${button.label} pressed: Reloading...';
       });
 
       _reloadTimer?.cancel();
@@ -1215,16 +1343,12 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
         setState(() {
           _ammoLeft = _startingAmmo;
           _isReloading = false;
-          _eventText = 'Reload complete.';
         });
       });
+      unawaited(_armGunForMatch(profile));
       return;
     }
 
-    setState(() {
-      _eventText =
-          '${button.label} pressed: no action mapped for this button in profile.';
-    });
   }
 
   Future<void> _toggleRecoilFromPowerButton() async {
@@ -1233,9 +1357,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _eventText = 'Open Gun Settings first to configure the gun profile.';
-      });
       return;
     }
 
@@ -1249,27 +1370,11 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
 
     setState(() {
       _savedGunProfile = updatedProfile;
-      _eventText = nextRecoilEnabled
-          ? 'Recoil mode enabled via Power Button.'
-          : 'Recoil mode disabled via Power Button.';
     });
 
     if (_gunConnected) {
       await _applyRecoilModeToGun(updatedProfile);
     }
-  }
-
-  Widget _buildGunButtonTestPad() {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: GunButton.values.map((button) {
-        return OutlinedButton(
-          onPressed: () => unawaited(_handleGunButtonPress(button)),
-          child: Text(button.label),
-        );
-      }).toList(),
-    );
   }
 
   void _cycleRole() {
@@ -1278,7 +1383,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     final nextIndex = (currentIndex + 1) % roles.length;
     setState(() {
       _role = roles[nextIndex];
-      _eventText = 'Role switched to $_role.';
     });
   }
 
@@ -1287,12 +1391,47 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   }
 
   LatLng _playerPosition() {
-    return _gpsPlayerPosition ??
-        const LatLng(_playerLatitude, _playerLongitude);
+    return _gpsPlayerPosition ?? const LatLng(0, 0);
   }
 
-  LatLng _contactToLatLng(_RadarContact contact) {
-    return _metersToLatLng(contact.xMeters, contact.yMeters);
+  ({double xMeters, double yMeters}) _latLngToRelativeMeters(
+    double lat,
+    double lon,
+  ) {
+    final origin = _playerPosition();
+    const metersPerDegreeLat = 111320.0;
+    final metersPerDegreeLon =
+        111320.0 * math.cos(origin.latitude * math.pi / 180);
+    final xMeters = (lon - origin.longitude) * metersPerDegreeLon;
+    final yMeters = -(lat - origin.latitude) * metersPerDegreeLat;
+    return (xMeters: xMeters, yMeters: yMeters);
+  }
+
+  List<_RadarContact> _contactsFromSnapshot(NetworkSnapshot? snapshot) {
+    if (snapshot == null) {
+      return const <_RadarContact>[];
+    }
+    final result = <_RadarContact>[];
+    for (final player in snapshot.players.values) {
+      if (player.id == widget.service.localPlayerId) {
+        continue;
+      }
+      final lat = player.latitude;
+      final lon = player.longitude;
+      if (lat == null || lon == null) {
+        continue;
+      }
+      final rel = _latLngToRelativeMeters(lat, lon);
+      result.add(
+        _RadarContact(
+          id: player.name.isNotEmpty ? player.name : player.id,
+          team: player.group,
+          xMeters: rel.xMeters,
+          yMeters: rel.yMeters,
+        ),
+      );
+    }
+    return result;
   }
 
   LatLng _metersToLatLng(double xMeters, double yMeters) {
@@ -1308,42 +1447,42 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     );
   }
 
-  Color _itemColor(_ItemCategory category) {
+  Color _itemCategoryColor(GameItemCategory category) {
     switch (category) {
-      case _ItemCategory.healing:
+      case GameItemCategory.healing:
         return Colors.lightGreenAccent;
-      case _ItemCategory.armor:
+      case GameItemCategory.armor:
         return Colors.lightBlueAccent;
-      case _ItemCategory.damage:
+      case GameItemCategory.damage:
         return Colors.deepOrangeAccent;
-      case _ItemCategory.special:
+      case GameItemCategory.special:
         return Colors.purpleAccent;
     }
   }
 
-  String _itemCategoryLabel(_ItemCategory category) {
+  String _itemCategoryLetter(GameItemCategory category) {
     switch (category) {
-      case _ItemCategory.healing:
-        return 'Healing';
-      case _ItemCategory.armor:
-        return 'Armor';
-      case _ItemCategory.damage:
-        return 'Damage';
-      case _ItemCategory.special:
-        return 'Special';
+      case GameItemCategory.healing:
+        return 'H';
+      case GameItemCategory.armor:
+        return 'A';
+      case GameItemCategory.damage:
+        return 'D';
+      case GameItemCategory.special:
+        return 'S';
     }
   }
 
-  String _itemCategoryLetter(_ItemCategory category) {
+  IconData _itemCategoryIcon(GameItemCategory category) {
     switch (category) {
-      case _ItemCategory.healing:
-        return 'H';
-      case _ItemCategory.armor:
-        return 'A';
-      case _ItemCategory.damage:
-        return 'D';
-      case _ItemCategory.special:
-        return 'S';
+      case GameItemCategory.healing:
+        return Icons.healing;
+      case GameItemCategory.armor:
+        return Icons.shield;
+      case GameItemCategory.damage:
+        return Icons.bolt;
+      case GameItemCategory.special:
+        return Icons.warning_amber;
     }
   }
 
@@ -1354,18 +1493,22 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   }
 
   List<CircleMarker> _buildItemPickupCircles() {
-    return _items
+    final items = _snapshot?.items ?? const <GameMapItem>[];
+    final circles = items
         .map(
           (item) => CircleMarker(
-            point: _metersToLatLng(item.xMeters, item.yMeters),
-            radius: _itemPickupRadiusMeters,
+            point: LatLng(item.latitude, item.longitude),
+            radius: 1.5,
             useRadiusInMeter: true,
-            color: _itemColor(item.category).withValues(alpha: 0.18),
+            color: _itemCategoryColor(item.category).withValues(alpha: 0.18),
             borderStrokeWidth: 1,
-            borderColor: _itemColor(item.category).withValues(alpha: 0.95),
+            borderColor: _itemCategoryColor(
+              item.category,
+            ).withValues(alpha: 0.95),
           ),
         )
         .toList();
+    return circles;
   }
 
   List<Marker> _buildMapMarkers() {
@@ -1378,34 +1521,47 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
       ),
     ];
 
-    for (final contact in _contacts) {
+    final otherPlayers = _snapshot?.players.values ?? const <PlayerState>[];
+    for (final player in otherPlayers) {
+      if (player.id == widget.service.localPlayerId) {
+        continue;
+      }
+      final lat = player.latitude;
+      final lon = player.longitude;
+      if (lat == null || lon == null) {
+        continue;
+      }
       markers.add(
         Marker(
-          point: _contactToLatLng(contact),
+          point: LatLng(lat, lon),
           width: 26,
           height: 26,
-          child: Icon(Icons.circle, color: _teamColor(contact.team), size: 14),
+          child: Icon(Icons.circle, color: _teamColor(player.group), size: 14),
         ),
       );
     }
 
-    for (final item in _items) {
+    final items = _snapshot?.items ?? const <GameMapItem>[];
+    for (final item in items) {
       markers.add(
         Marker(
-          point: _metersToLatLng(item.xMeters, item.yMeters),
+          point: LatLng(item.latitude, item.longitude),
           width: 32,
           height: 32,
           child: Container(
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: Colors.black.withValues(alpha: 0.7),
-              border: Border.all(color: _itemColor(item.category), width: 2),
+              border: Border.all(
+                color: _itemCategoryColor(item.category),
+                width: 2,
+              ),
             ),
             alignment: Alignment.center,
             child: Text(
               _itemCategoryLetter(item.category),
               style: TextStyle(
-                color: _itemColor(item.category),
+                color: _itemCategoryColor(item.category),
                 fontWeight: FontWeight.w900,
                 fontSize: 14,
               ),
@@ -1417,6 +1573,137 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     return markers;
   }
 
+  Widget _buildItemPickupOverlay() {
+    final overlay = _activePickupOverlay;
+    if (overlay == null || DateTime.now().isAfter(overlay.showUntil)) {
+      return const SizedBox.shrink();
+    }
+
+    final color = _itemCategoryColor(overlay.category);
+    return Positioned(
+      top: 16,
+      left: 16,
+      right: 16,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.82),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: color, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              children: <Widget>[
+                Icon(_itemCategoryIcon(overlay.category), color: color),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '${overlay.collectorId} picked ${overlay.category.label}: ${overlay.subcategoryLabel}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildKillOverlay() {
+    final message = _killOverlayMessage;
+    if (message == null) {
+      return const SizedBox.shrink();
+    }
+    return Positioned(
+      bottom: 120,
+      left: 24,
+      right: 24,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.88),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.redAccent, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                const Icon(
+                  Icons.local_fire_department,
+                  color: Colors.redAccent,
+                  size: 28,
+                ),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w800,
+                      fontSize: 18,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAirStrikeWarningOverlay() {
+    final strike = _pendingAirStrike;
+    if (strike == null) {
+      return const SizedBox.shrink();
+    }
+
+    final secondsLeft = strike.resolveAt
+        .difference(DateTime.now())
+        .inSeconds
+        .clamp(0, 7);
+    return Positioned(
+      top: 74,
+      left: 16,
+      right: 16,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.red.shade800.withValues(alpha: 0.9),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: Colors.amberAccent, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              children: <Widget>[
+                const Icon(Icons.sensors, color: Colors.amberAccent),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'AIR STRIKE WARNING: ${strike.targetId} targeted. Impact in ${secondsLeft}s',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _statusIconTile({
     required IconData icon,
     required String title,
@@ -1425,7 +1712,8 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
     Color? activeColor,
   }) {
     final brightness = Theme.of(context).brightness;
-    final teamPalette = teamPaletteFor(_team);
+    final localTeam = widget.service.localPlayer.group;
+    final teamPalette = teamPaletteFor(localTeam);
     final tileBg = teamPalette.secondary.withValues(
       alpha: brightness == Brightness.dark ? 0.2 : 0.28,
     );
@@ -1534,10 +1822,12 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
   @override
   Widget build(BuildContext context) {
     final statusColor = _isGameRunning ? Colors.greenAccent : Colors.redAccent;
-    final healthValue = _livesLeft / _maxLives;
+    final maxLives = _snapshot?.lobbyRules.maxLives ?? 10;
+    final healthValue = maxLives > 0 ? _livesLeft / maxLives.toDouble() : 0.0;
     final brightness = Theme.of(context).brightness;
-    final teamPalette = teamPaletteFor(_team);
-    final teamColors = teamBackgroundColors(_team, brightness: brightness);
+    final localTeam = widget.service.localPlayer.group;
+    final teamPalette = teamPaletteFor(localTeam);
+    final teamColors = teamBackgroundColors(localTeam, brightness: brightness);
     final panelBg = teamPalette.secondary.withValues(
       alpha: brightness == Brightness.dark ? 0.2 : 0.28,
     );
@@ -1560,7 +1850,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
           alpha: brightness == Brightness.dark ? 0.9 : 0.8,
         ),
         foregroundColor: teamPalette.foreground(brightness),
-        title: const Text('Player Screen Test (Simulation)'),
+        title: const Text('Player Game'),
         actions: <Widget>[
           ThemeToggleButton(color: teamPalette.foreground(brightness)),
         ],
@@ -1592,27 +1882,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: <Widget>[
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 8,
-                              ),
-                              decoration: BoxDecoration(
-                                color: panelBg,
-                                border: Border.all(color: panelBorder),
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                              child: Text(
-                                'Simulation mode: no server required. Live HUD and radar test.',
-                                style: TextStyle(
-                                  color: panelTextColor,
-                                  fontSize: 12,
-                                ),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
                             SizedBox(
                               height: hudPanelHeight,
                               child: Card(
@@ -1631,7 +1900,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                         children: <Widget>[
                                           Expanded(
                                             child: Text(
-                                              _playerName,
+                                              widget.service.localPlayer.name,
                                               style: Theme.of(context)
                                                   .textTheme
                                                   .titleMedium
@@ -1642,9 +1911,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                             ),
                                           ),
                                           Text(
-                                            _team,
+                                            localTeam,
                                             style: TextStyle(
-                                              color: _teamColor(_team),
+                                              color: _teamColor(localTeam),
                                               fontWeight: FontWeight.w700,
                                             ),
                                           ),
@@ -1733,7 +2002,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                             icon: Icons.shield,
                                             title: 'Shield',
                                             value: _shieldActive ? 'On' : 'Off',
-                                            onTap: _toggleShieldBonus,
+                                            onTap: () {},
                                             activeColor: _shieldActive
                                                 ? Colors.lightBlueAccent
                                                 : Colors.white54,
@@ -1742,11 +2011,11 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                           _statusIconTile(
                                             icon: Icons.healing,
                                             title: 'Heal',
-                                            value: _healingBoostActive
-                                                ? 'On'
-                                                : 'Off',
+                                            value: _canUsePlayerHeal
+                                                ? 'Ready'
+                                                : 'None',
                                             onTap: _toggleHealingBonus,
-                                            activeColor: _healingBoostActive
+                                            activeColor: _canUsePlayerHeal
                                                 ? Colors.lightGreenAccent
                                                 : Colors.white54,
                                           ),
@@ -1772,7 +2041,7 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                             Expanded(
                                               child: Text(
                                                 'Time ${_formatTime(_timeRemaining)}\n'
-                                                'Lives $_livesLeft/$_maxLives',
+                                                'Lives $_livesLeft/${_snapshot?.lobbyRules.maxLives ?? 10}',
                                                 style: const TextStyle(
                                                   color: Colors.white,
                                                   fontSize: 12,
@@ -1782,28 +2051,20 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                             ),
                                             Expanded(
                                               child: Text(
-                                                'Score $_score\n'
-                                                'Shots $_shotsFired\n'
-                                                'Hits $_hitsTaken\n'
-                                                'Items ${_items.length}',
+                                                'Score ${widget.service.localPlayer.score}\n'
+                                                'Shots ${widget.service.localPlayer.shotsFired}\n'
+                                                'Hits ${widget.service.localPlayer.hitsTaken}\n'
+                                                'Items ${_snapshot?.items.length ?? 0}\n'
+                                                'AmmoBoost ${_noReloadExpiresAt != null && DateTime.now().isBefore(_noReloadExpiresAt!) ? 'On' : 'Off'}',
                                                 style: const TextStyle(
                                                   color: Colors.white,
                                                   fontSize: 12,
                                                 ),
-                                                maxLines: 4,
+                                                maxLines: 5,
                                               ),
                                             ),
                                           ],
                                         ),
-                                      ),
-                                      Text(
-                                        'Event: $_eventText',
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                          fontSize: 12,
-                                        ),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
                                       ),
                                     ],
                                   ),
@@ -1884,7 +2145,10 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                                               ),
                                               CustomPaint(
                                                 painter: _RadarPainter(
-                                                  contacts: _contacts,
+                                                  contacts:
+                                                      _contactsFromSnapshot(
+                                                        _snapshot,
+                                                      ),
                                                   radarRangeMeters:
                                                       _radarRangeMeters,
                                                   sweepDegrees:
@@ -1928,8 +2192,6 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
-                            const SizedBox(height: 8),
-                            _buildGunButtonTestPad(),
                           ],
                         ),
                       ),
@@ -1939,6 +2201,9 @@ class _PlayerGameTestScreenState extends State<PlayerGameTestScreen> {
               ),
             ),
           ),
+          _buildItemPickupOverlay(),
+          _buildAirStrikeWarningOverlay(),
+          _buildKillOverlay(),
           _buildGunDisconnectedOverlay(overlaySearchButtonStyle),
         ],
       ),
@@ -1960,34 +2225,28 @@ class _RadarContact {
   final double yMeters;
 }
 
-enum _ItemCategory { healing, armor, damage, special }
-
-class _MapItem {
-  const _MapItem({
-    required this.id,
+class _ItemPickupOverlay {
+  const _ItemPickupOverlay({
+    required this.collectorId,
     required this.category,
-    required this.xMeters,
-    required this.yMeters,
+    required this.subcategoryLabel,
+    required this.showUntil,
   });
 
-  final String id;
-  final _ItemCategory category;
-  final double xMeters;
-  final double yMeters;
+  final String collectorId;
+  final GameItemCategory category;
+  final String subcategoryLabel;
+  final DateTime showUntil;
 }
 
-class _SimulatedPlayer {
-  const _SimulatedPlayer({
-    required this.id,
-    required this.team,
-    required this.xMeters,
-    required this.yMeters,
+class _PendingAirStrike {
+  const _PendingAirStrike({
+    required this.targetId,
+    required this.resolveAt,
   });
 
-  final String id;
-  final String team;
-  final double xMeters;
-  final double yMeters;
+  final String targetId;
+  final DateTime resolveAt;
 }
 
 class _RadarPainter extends CustomPainter {

@@ -129,7 +129,7 @@ class LobbyRules {
       reloadTimeSeconds = 2,
       maxLives = 10,
       matchLengthMinutes = 10,
-      maxPlayers = 8,
+      maxPlayers = 6,
       respawnDelaySeconds = 3,
       itemSpawnRateSeconds = 30,
       respawnMode = RespawnMode.onDeath,
@@ -227,7 +227,7 @@ class LobbyRules {
       reloadTimeSeconds: json['reloadTimeSeconds'] as int? ?? 2,
       maxLives: json['maxLives'] as int? ?? 10,
       matchLengthMinutes: json['matchLengthMinutes'] as int? ?? 10,
-      maxPlayers: json['maxPlayers'] as int? ?? 8,
+      maxPlayers: json['maxPlayers'] as int? ?? 6,
       respawnDelaySeconds: json['respawnDelaySeconds'] as int? ?? 3,
       itemSpawnRateSeconds: json['itemSpawnRateSeconds'] as int? ?? 30,
       respawnMode: _respawnModeFromString(
@@ -248,12 +248,14 @@ class NetworkSnapshot {
     required this.localPlayerId,
     required this.players,
     required this.lobbyRules,
+    required this.lobbyOpen,
     required this.items,
     required this.activeEffects,
     required this.recentItemPickups,
     required this.gamePhase,
     required this.serverPlayerId,
     required this.scheduledGameStartAt,
+    required this.gameStartedAt,
     required this.readyTeamLeadIds,
     required this.teamLeadCount,
   });
@@ -261,12 +263,14 @@ class NetworkSnapshot {
   final String localPlayerId;
   final Map<String, PlayerState> players;
   final LobbyRules lobbyRules;
+  final bool lobbyOpen;
   final List<GameMapItem> items;
   final List<ActiveGameEffect> activeEffects;
   final List<GameItemPickupNotification> recentItemPickups;
   final GamePhase gamePhase;
   final String? serverPlayerId;
   final DateTime? scheduledGameStartAt;
+  final DateTime? gameStartedAt;
   final Set<String> readyTeamLeadIds;
   final int teamLeadCount;
 }
@@ -289,6 +293,22 @@ class TeamVoiceMessage {
   final String mimeType;
   final int durationMs;
   final DateTime sentAt;
+}
+
+class _PreservedPlayerStats {
+  const _PreservedPlayerStats({
+    required this.score,
+    required this.kills,
+    required this.hitsLanded,
+    required this.shotsFired,
+    required this.hitsTaken,
+  });
+
+  final int score;
+  final int kills;
+  final int hitsLanded;
+  final int shotsFired;
+  final int hitsTaken;
 }
 
 class GameNetworkService {
@@ -322,6 +342,8 @@ class GameNetworkService {
       <GameItemPickupNotification>[];
   final Map<String, Timer> _disconnectionGracePeriodTimers = <String, Timer>{};
   final Map<String, Timer> _respawnTimers = <String, Timer>{};
+    final Map<String, _PreservedPlayerStats> _preservedStatsByPlayerId =
+      <String, _PreservedPlayerStats>{};
   StreamSubscription<DatagramEnvelope>? _sub;
   Timer? _scheduledStartTriggerTimer;
   Timer? _scheduledStartTimer;
@@ -334,9 +356,12 @@ class GameNetworkService {
   static const double _itemPickupRadiusMeters = 1.5;
   LobbyRules _lobbyRules = const LobbyRules.defaults();
   GamePhase _gamePhase = GamePhase.setup;
+  bool _lobbyOpen = false;
   String? _serverPlayerId;
   int? _localRecoilPlayerId;
   DateTime? _scheduledGameStartAt;
+  DateTime? _gameStartedAt;
+  Duration _serverClockOffset = Duration.zero;
   Set<String> _readyTeamLeadIds = <String>{};
   DateTime? _lastGpsBroadcast;
   DateTime? _lastItemSpawnAt;
@@ -344,6 +369,13 @@ class GameNetworkService {
   Stream<NetworkSnapshot> get updates => _updates.stream;
   Stream<TeamVoiceMessage> get teamVoiceMessages => _teamVoiceMessages.stream;
   Stream<KillEvent> get killEvents => _killEvents.stream;
+
+  DateTime get synchronizedNow {
+    if (isServer) {
+      return DateTime.now().toUtc();
+    }
+    return DateTime.now().toUtc().add(_serverClockOffset);
+  }
 
   int? get localRecoilPlayerId => _localRecoilPlayerId;
 
@@ -426,12 +458,14 @@ class GameNetworkService {
       isServer ? (Map.of(_players)..remove(localPlayerId)) : _players,
     ),
     lobbyRules: _lobbyRules,
+    lobbyOpen: _lobbyOpen,
     items: List.unmodifiable(_items),
     activeEffects: List.unmodifiable(_activeEffects),
     recentItemPickups: List.unmodifiable(_recentItemPickups),
     gamePhase: _gamePhase,
     serverPlayerId: _serverPlayerId,
     scheduledGameStartAt: _scheduledGameStartAt,
+    gameStartedAt: _gameStartedAt,
     readyTeamLeadIds: Set.unmodifiable(_readyTeamLeadIds),
     teamLeadCount: _teamLeadIds().length,
   );
@@ -449,6 +483,8 @@ class GameNetworkService {
       group: initialPlayerGroup,
       playerClass: 'Assult',
       score: 0,
+      kills: 0,
+      hitsLanded: 0,
       shotsFired: 0,
       hitsTaken: 0,
       gunConnected: isServer,
@@ -564,6 +600,19 @@ class GameNetworkService {
     await _broadcastState();
   }
 
+  Future<void> setLobbyOpen(bool open) async {
+    if (!isServer) {
+      return;
+    }
+    if (_lobbyOpen == open) {
+      return;
+    }
+
+    _lobbyOpen = open;
+    _emit();
+    await _broadcastState();
+  }
+
   Future<void> startGame() async {
     if (!isServer) {
       return;
@@ -587,7 +636,8 @@ class GameNetworkService {
     _scheduledStartTimer?.cancel();
     _assignRoundRoles();
     _readyTeamLeadIds = <String>{};
-    _scheduledGameStartAt = DateTime.now().add(delay);
+    _gameStartedAt = null;
+    _scheduledGameStartAt = DateTime.now().toUtc().add(delay);
 
     _scheduledStartTriggerTimer = Timer(delay, () {
       unawaited(_startGameNow());
@@ -646,6 +696,7 @@ class GameNetworkService {
     _scheduledStartTimer?.cancel();
     _scheduledStartTimer = null;
     _scheduledGameStartAt = null;
+    _gameStartedAt = DateTime.now().toUtc();
     _readyTeamLeadIds = <String>{};
     _items.clear();
     _activeEffects.clear();
@@ -667,6 +718,7 @@ class GameNetworkService {
     _scheduledStartTimer?.cancel();
     _scheduledStartTimer = null;
     _scheduledGameStartAt = null;
+    _gameStartedAt = null;
     _readyTeamLeadIds = <String>{};
     _items.clear();
     _activeEffects.clear();
@@ -819,6 +871,15 @@ class GameNetworkService {
                 hitsTaken: target.hitsTaken + 1,
                 lastSeen: DateTime.now(),
               );
+              final shooter = _players[packet.playerId];
+              if (shooter != null) {
+                _players[packet.playerId] = shooter.copyWith(
+                  score: shooter.score + 1,
+                  kills: shooter.kills + 1,
+                  hitsLanded: shooter.hitsLanded + 1,
+                  lastSeen: DateTime.now(),
+                );
+              }
               _scheduleRespawnIfNeeded(targetPlayerId);
               _emit();
               unawaited(_broadcastState());
@@ -827,10 +888,6 @@ class GameNetworkService {
         }
 
         if (packet.playerId == localPlayerId) {
-          _players[localPlayerId] = localPlayer.copyWith(
-            score: localPlayer.score + 1,
-            lastSeen: DateTime.now(),
-          );
           // Notify shooter's screen
           final victimId = packet.targetPlayerId;
           if (victimId != null && !_killEvents.isClosed) {
@@ -918,6 +975,7 @@ class GameNetworkService {
       return <String>{};
     }
     return _players.values
+      .where((player) => !player.isHost)
         .where((player) => player.playerClass == 'Team Lead')
         .map((player) => player.id)
         .toSet();
@@ -990,15 +1048,43 @@ class GameNetworkService {
         (packet.payload['longitude'] as num?)?.toDouble() ??
         existing?.longitude;
 
+    if (!isServer && isHost) {
+      // Host device is controller-only and should not appear as a player.
+      return;
+    }
+
+    if (isServer && existing == null && !isHost) {
+      // New players may only join after server explicitly opens the lobby.
+      if (!_lobbyOpen) {
+        return;
+      }
+
+      // Enforce lobby capacity for non-host players.
+      final activePlayerCount = _players.values
+          .where((player) => !player.isHost)
+          .length;
+      if (activePlayerCount >= _lobbyRules.maxPlayers) {
+        return;
+      }
+      // Block new joins while a running/ended match disallows mid-game join.
+      if ((_gamePhase == GamePhase.running || _gamePhase == GamePhase.ended) &&
+          !_lobbyRules.allowMidGameJoin) {
+        return;
+      }
+    }
+
     if (existing == null) {
+      final preservedStats = _preservedStatsByPlayerId[id];
       _players[id] = PlayerState(
         id: id,
         name: packet.playerName ?? id,
         group: group,
         playerClass: playerClass,
-        score: 0,
-        shotsFired: 0,
-        hitsTaken: 0,
+        score: preservedStats?.score ?? 0,
+        kills: preservedStats?.kills ?? 0,
+        hitsLanded: preservedStats?.hitsLanded ?? 0,
+        shotsFired: preservedStats?.shotsFired ?? 0,
+        hitsTaken: preservedStats?.hitsTaken ?? 0,
         gunConnected: gunConnected,
         isHost: isHost,
         lastSeen: DateTime.now(),
@@ -1028,9 +1114,12 @@ class GameNetworkService {
   void _assignRoundRoles() {
     if (_lobbyRules.gameType == GameType.freeForAll) {
       for (final player in _players.values) {
+        if (player.isHost) {
+          continue;
+        }
         _players[player.id] = player.copyWith(
           playerClass: 'Assult',
-          group: player.isHost ? player.group : 'FFA',
+          group: 'FFA',
           lastSeen: DateTime.now(),
         );
       }
@@ -1039,7 +1128,7 @@ class GameNetworkService {
     }
 
     final byTeam = <String, List<PlayerState>>{};
-    for (final player in _players.values) {
+    for (final player in _players.values.where((p) => !p.isHost)) {
       byTeam.putIfAbsent(player.group, () => <PlayerState>[]).add(player);
     }
 
@@ -1065,9 +1154,14 @@ class GameNetworkService {
       playerId: localPlayerId,
       playerName: localPlayer.name,
       payload: <String, dynamic>{
+        'lobbyOpen': _lobbyOpen,
         'serverPlayerId': _serverPlayerId,
+        'serverNow': DateTime.now().toUtc().toIso8601String(),
         'gamePhase': _gamePhase.name,
-        'scheduledGameStartAt': _scheduledGameStartAt?.toIso8601String(),
+        'scheduledGameStartAt': _scheduledGameStartAt
+            ?.toUtc()
+            .toIso8601String(),
+        'gameStartedAt': _gameStartedAt?.toUtc().toIso8601String(),
         'readyTeamLeadIds': _readyTeamLeadIds.toList(),
         'rules': _lobbyRules.toJson(),
         'items': _items.map((item) => item.toJson()).toList(),
@@ -1376,6 +1470,8 @@ class GameNetworkService {
       'group': player.group,
       'playerClass': player.playerClass,
       'score': player.score,
+      'kills': player.kills,
+      'hitsLanded': player.hitsLanded,
       'shotsFired': player.shotsFired,
       'hitsTaken': player.hitsTaken,
       'gunConnected': player.gunConnected,
@@ -1390,12 +1486,30 @@ class GameNetworkService {
   }
 
   void _applyStatePacket(NetworkPacket packet) {
+    final receivedAtUtc = DateTime.now().toUtc();
+    final serverNowUtc = DateTime.tryParse(
+      packet.payload['serverNow'] as String? ?? '',
+    );
+    if (serverNowUtc != null) {
+      final measuredOffset = serverNowUtc.difference(receivedAtUtc);
+      // Smooth per-packet jitter so countdown/timers don't visually jump.
+      final smoothedMilliseconds =
+          ((_serverClockOffset.inMilliseconds * 3) +
+              measuredOffset.inMilliseconds) ~/
+          4;
+      _serverClockOffset = Duration(milliseconds: smoothedMilliseconds);
+    }
+
+    _lobbyOpen = packet.payload['lobbyOpen'] as bool? ?? false;
     _serverPlayerId = packet.payload['serverPlayerId'] as String?;
     _gamePhase = _phaseFromString(
       packet.payload['gamePhase'] as String? ?? 'setup',
     );
     _scheduledGameStartAt = DateTime.tryParse(
       packet.payload['scheduledGameStartAt'] as String? ?? '',
+    );
+    _gameStartedAt = DateTime.tryParse(
+      packet.payload['gameStartedAt'] as String? ?? '',
     );
     _readyTeamLeadIds =
         (packet.payload['readyTeamLeadIds'] as List<dynamic>? ??
@@ -1458,6 +1572,8 @@ class GameNetworkService {
         group: player['group'] as String? ?? 'A',
         playerClass: player['playerClass'] as String? ?? 'Assult',
         score: player['score'] as int? ?? 0,
+        kills: player['kills'] as int? ?? 0,
+        hitsLanded: player['hitsLanded'] as int? ?? 0,
         shotsFired: player['shotsFired'] as int? ?? 0,
         hitsTaken: player['hitsTaken'] as int? ?? 0,
         gunConnected: player['gunConnected'] as bool? ?? false,
@@ -1471,25 +1587,23 @@ class GameNetworkService {
       );
     }
 
-    if (nextPlayers.isNotEmpty) {
-      // Preserve the local player's own entry in case the server broadcast
-      // arrived before our hello was registered on the server side.
-      final selfState = _players[localPlayerId];
-      final selfRecoilPlayerId = _recoilIdByPlayerId[localPlayerId];
-      _players
-        ..clear()
-        ..addAll(nextPlayers);
-      if (selfState != null && !_players.containsKey(localPlayerId)) {
-        _players[localPlayerId] = selfState;
-      }
+    // Preserve the local player's own entry in case the server broadcast
+    // arrived before our hello was registered on the server side.
+    final selfState = _players[localPlayerId];
+    final selfRecoilPlayerId = _recoilIdByPlayerId[localPlayerId];
+    _players
+      ..clear()
+      ..addAll(nextPlayers);
+    if (selfState != null && !_players.containsKey(localPlayerId)) {
+      _players[localPlayerId] = selfState;
+    }
 
-      _recoilIdByPlayerId
-        ..removeWhere((playerId, _) => playerId != localPlayerId)
-        ..addAll(nextRecoilIdByPlayerId);
-      if (selfRecoilPlayerId != null &&
-          !_recoilIdByPlayerId.containsKey(localPlayerId)) {
-        _recoilIdByPlayerId[localPlayerId] = selfRecoilPlayerId;
-      }
+    _recoilIdByPlayerId
+      ..removeWhere((playerId, _) => playerId != localPlayerId)
+      ..addAll(nextRecoilIdByPlayerId);
+    if (selfRecoilPlayerId != null &&
+        !_recoilIdByPlayerId.containsKey(localPlayerId)) {
+      _recoilIdByPlayerId[localPlayerId] = selfRecoilPlayerId;
     }
   }
 
@@ -1552,6 +1666,16 @@ class GameNetworkService {
 
   /// Ends the grace period for a disconnected player and removes them from the game.
   void _endDisconnectionGracePeriod(String playerId) {
+    final removed = _players[playerId];
+    if (removed != null && !removed.isHost) {
+      _preservedStatsByPlayerId[playerId] = _PreservedPlayerStats(
+        score: removed.score,
+        kills: removed.kills,
+        hitsLanded: removed.hitsLanded,
+        shotsFired: removed.shotsFired,
+        hitsTaken: removed.hitsTaken,
+      );
+    }
     _respawnTimers.remove(playerId)?.cancel();
     _disconnectionGracePeriodTimers.remove(playerId);
     _players.remove(playerId);

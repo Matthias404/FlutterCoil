@@ -53,6 +53,7 @@ class _ServerScreenState extends State<ServerScreen> {
   bool _teamLeadVoiceOnly = true;
   bool _showOtherPlayersOnMap = true;
   bool _isLobbyOpen = false;
+  bool _rulesFormInitializedFromSnapshot = false;
 
   GameType _gameTypeForPreset(_GameModePreset preset) {
     switch (preset) {
@@ -137,24 +138,29 @@ class _ServerScreenState extends State<ServerScreen> {
       }
 
       setState(() {
-        _selectedPreset = _presetForGameType(snapshot.lobbyRules.gameType);
         _snapshot = snapshot;
-        _firingEnvironment = snapshot.lobbyRules.firingEnvironment;
-        _maxLives = snapshot.lobbyRules.maxLives.toDouble();
-        _magazineSize = snapshot.lobbyRules.magazineSize.toDouble();
-        _reloadTimeSeconds = snapshot.lobbyRules.reloadTimeSeconds.toDouble();
-        _matchLength = snapshot.lobbyRules.matchLengthMinutes.toDouble();
-        _respawnDelaySeconds = snapshot.lobbyRules.respawnDelaySeconds
-            .toDouble();
-        _itemSpawnRateSeconds = _normalizeItemSpawnRate(
-          snapshot.lobbyRules.itemSpawnRateSeconds.toDouble(),
-        );
-        _hillRadiusMeters = snapshot.lobbyRules.hillRadiusMeters;
-        _respawnMode = snapshot.lobbyRules.respawnMode;
-        _friendlyFire = snapshot.lobbyRules.friendlyFire;
-        _allowMidGameJoin = snapshot.lobbyRules.allowMidGameJoin;
-        _teamLeadVoiceOnly = snapshot.lobbyRules.teamLeadVoiceOnly;
-        _showOtherPlayersOnMap = snapshot.lobbyRules.showOtherPlayersOnMap;
+        _isLobbyOpen = snapshot.lobbyOpen;
+        // Load remote rules into the form once, then keep local edits stable.
+        if (!_rulesFormInitializedFromSnapshot) {
+          _selectedPreset = _presetForGameType(snapshot.lobbyRules.gameType);
+          _firingEnvironment = snapshot.lobbyRules.firingEnvironment;
+          _maxLives = snapshot.lobbyRules.maxLives.toDouble();
+          _magazineSize = snapshot.lobbyRules.magazineSize.toDouble();
+          _reloadTimeSeconds = snapshot.lobbyRules.reloadTimeSeconds.toDouble();
+          _matchLength = snapshot.lobbyRules.matchLengthMinutes.toDouble();
+          _respawnDelaySeconds = snapshot.lobbyRules.respawnDelaySeconds
+              .toDouble();
+          _itemSpawnRateSeconds = _normalizeItemSpawnRate(
+            snapshot.lobbyRules.itemSpawnRateSeconds.toDouble(),
+          );
+          _hillRadiusMeters = snapshot.lobbyRules.hillRadiusMeters;
+          _respawnMode = snapshot.lobbyRules.respawnMode;
+          _friendlyFire = snapshot.lobbyRules.friendlyFire;
+          _allowMidGameJoin = snapshot.lobbyRules.allowMidGameJoin;
+          _teamLeadVoiceOnly = snapshot.lobbyRules.teamLeadVoiceOnly;
+          _showOtherPlayersOnMap = snapshot.lobbyRules.showOtherPlayersOnMap;
+          _rulesFormInitializedFromSnapshot = true;
+        }
       });
     });
     if (!mounted) {
@@ -273,27 +279,42 @@ class _ServerScreenState extends State<ServerScreen> {
   }
 
   Future<void> _applyServerRules() async {
+    final selectedPreset = _selectedPreset;
+    final firingEnvironment = _firingEnvironment;
+    final maxLives = _maxLives.round();
+    final magazineSize = _magazineSize.round();
+    final reloadTimeSeconds = _reloadTimeSeconds.round();
+    final matchLength = _matchLength.round();
+    final respawnDelaySeconds = _respawnDelaySeconds.round();
+    final itemSpawnRateSeconds = _itemSpawnDisabled
+        ? _itemSpawnDisabledSeconds.round()
+        : _normalizeItemSpawnRate(_itemSpawnRateSeconds).round();
+    final hillRadiusMeters = _hillRadiusMeters;
+    final respawnMode = _respawnMode;
+    final friendlyFire = _friendlyFire;
+    final allowMidGameJoin = _allowMidGameJoin;
+    final teamLeadVoiceOnly = _teamLeadVoiceOnly;
+    final showOtherPlayersOnMap = _showOtherPlayersOnMap;
+
     await _service.updateLocalProfile(name: _serverNameController.text.trim());
     await _service.updateLobbyRules(
       LobbyRules(
-        gameType: _gameTypeForPreset(_selectedPreset),
-        firingEnvironment: _firingEnvironment,
-        magazineSize: _magazineSize.round(),
-        reloadTimeSeconds: _reloadTimeSeconds.round(),
-        maxLives: _maxLives.round(),
-        matchLengthMinutes: _matchLength.round(),
-        maxPlayers: _snapshot?.lobbyRules.maxPlayers ?? 8,
-        respawnDelaySeconds: _respawnDelaySeconds.round(),
-        itemSpawnRateSeconds: _itemSpawnDisabled
-            ? _itemSpawnDisabledSeconds.round()
-            : _normalizeItemSpawnRate(_itemSpawnRateSeconds).round(),
-        respawnMode: _respawnMode,
+        gameType: _gameTypeForPreset(selectedPreset),
+        firingEnvironment: firingEnvironment,
+        magazineSize: magazineSize,
+        reloadTimeSeconds: reloadTimeSeconds,
+        maxLives: maxLives,
+        matchLengthMinutes: matchLength,
+        maxPlayers: _snapshot?.lobbyRules.maxPlayers ?? 6,
+        respawnDelaySeconds: respawnDelaySeconds,
+        itemSpawnRateSeconds: itemSpawnRateSeconds,
+        respawnMode: respawnMode,
         baseRadiusMeters: 2.0,
-        hillRadiusMeters: _hillRadiusMeters,
-        friendlyFire: _friendlyFire,
-        allowMidGameJoin: _allowMidGameJoin,
-        teamLeadVoiceOnly: _teamLeadVoiceOnly,
-        showOtherPlayersOnMap: _showOtherPlayersOnMap,
+        hillRadiusMeters: hillRadiusMeters,
+        friendlyFire: friendlyFire,
+        allowMidGameJoin: allowMidGameJoin,
+        teamLeadVoiceOnly: teamLeadVoiceOnly,
+        showOtherPlayersOnMap: showOtherPlayersOnMap,
       ),
     );
     if (!mounted) {
@@ -307,6 +328,7 @@ class _ServerScreenState extends State<ServerScreen> {
 
   Future<void> _openLobby() async {
     await _applyServerRules();
+    await _service.setLobbyOpen(true);
     if (!mounted) {
       return;
     }
@@ -333,6 +355,7 @@ class _ServerScreenState extends State<ServerScreen> {
             ),
           ),
           onCloseLobby: () {
+            unawaited(_service.setLobbyOpen(false));
             if (!mounted) {
               return;
             }
@@ -449,6 +472,7 @@ class _ServerScreenState extends State<ServerScreen> {
                       ),
                       TextButton(
                         onPressed: () {
+                          unawaited(_service.setLobbyOpen(false));
                           setState(() {
                             _isLobbyOpen = false;
                             _status = 'Lobby closed.';
@@ -1092,7 +1116,7 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
               title: Text(player.name),
               subtitle: Text(
                 'group=${player.group} gun=${player.gunConnected ? 'connected' : 'not connected'} '
-                'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} score=${player.score} hits=${player.hitsTaken}',
+                'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} score=${player.score} kills=${player.kills} hits=${player.hitsLanded} taken=${player.hitsTaken}',
               ),
               trailing: player.isHost ? const Icon(Icons.shield) : null,
             ),

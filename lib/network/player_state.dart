@@ -5,6 +5,8 @@ class PlayerState {
     required this.group,
     required this.playerClass,
     required this.score,
+    required this.kills,
+    required this.hitsLanded,
     required this.shotsFired,
     required this.hitsTaken,
     required this.gunConnected,
@@ -20,6 +22,8 @@ class PlayerState {
   final String group;
   final String playerClass;
   final int score;
+  final int kills;
+  final int hitsLanded;
   final int shotsFired;
   final int hitsTaken;
   final bool gunConnected;
@@ -35,6 +39,8 @@ class PlayerState {
     String? group,
     String? playerClass,
     int? score,
+    int? kills,
+    int? hitsLanded,
     int? shotsFired,
     int? hitsTaken,
     bool? gunConnected,
@@ -50,6 +56,8 @@ class PlayerState {
       group: group ?? this.group,
       playerClass: playerClass ?? this.playerClass,
       score: score ?? this.score,
+      kills: kills ?? this.kills,
+      hitsLanded: hitsLanded ?? this.hitsLanded,
       shotsFired: shotsFired ?? this.shotsFired,
       hitsTaken: hitsTaken ?? this.hitsTaken,
       gunConnected: gunConnected ?? this.gunConnected,

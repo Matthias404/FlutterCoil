@@ -54,7 +54,8 @@ class _PlayerLobbyScreenState extends State<PlayerLobbyScreen> {
     });
   }
 
-  bool get _isFreeForAll => _snapshot.lobbyRules.gameType == GameType.freeForAll;
+  bool get _isFreeForAll =>
+      _snapshot.lobbyRules.gameType == GameType.freeForAll;
 
   bool get _countdownStarted =>
       _snapshot.scheduledGameStartAt != null ||
@@ -111,15 +112,21 @@ class _PlayerLobbyScreenState extends State<PlayerLobbyScreen> {
     final allPlayers = _snapshot.players.values.toList();
     final localPlayer = _snapshot.players[widget.service.localPlayerId];
     if (localPlayer != null &&
-        !allPlayers.any((player) => player.id == widget.service.localPlayerId)) {
+        !allPlayers.any(
+          (player) => player.id == widget.service.localPlayerId,
+        )) {
       allPlayers.insert(0, localPlayer);
     }
 
     final groupedPlayers = _playersByTeam(allPlayers);
     final rules = _snapshot.lobbyRules;
     final scheduledStartAt = _snapshot.scheduledGameStartAt;
-    final countdown = scheduledStartAt?.difference(DateTime.now());
-    final countdownLabel = countdown == null ? null : _formatCountdown(countdown);
+    final countdown = scheduledStartAt?.difference(
+      widget.service.synchronizedNow,
+    );
+    final countdownLabel = countdown == null
+        ? null
+        : _formatCountdown(countdown);
 
     return Scaffold(
       appBar: AppBar(
@@ -155,9 +162,7 @@ class _PlayerLobbyScreenState extends State<PlayerLobbyScreen> {
           const SizedBox(height: 4),
           if (countdownLabel != null) ...<Widget>[
             Text('Start countdown: $countdownLabel'),
-          ] else ...<Widget>[
-            const Text('Start countdown: not started'),
-          ],
+          ] else ...<Widget>[const Text('Start countdown: not started')],
           const SizedBox(height: 12),
           if (!_isFreeForAll)
             DropdownButtonFormField<String>(

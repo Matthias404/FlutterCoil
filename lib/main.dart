@@ -4,7 +4,6 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:lasertag_app/screens/player/player_game_screen.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -12,7 +11,6 @@ import 'network/join_code.dart';
 import 'network/protocol.dart';
 import 'network/transport.dart';
 import 'screens/player/player_screen.dart';
-import 'screens/player/player_screen_with_code.dart';
 import 'screens/server/server_screen.dart';
 import 'theme/app_theme.dart';
 import 'theme/team_colors.dart';
@@ -515,7 +513,7 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
               ?.cast<String, dynamic>();
 
           final playerCount = statePlayers.length;
-          final maxPlayers = stateRules?['maxPlayers'] as int? ?? 8;
+          final maxPlayers = stateRules?['maxPlayers'] as int? ?? 6;
           final serverName = packet.playerName?.trim().isNotEmpty == true
               ? packet.playerName!.trim()
               : 'LAN Server';
@@ -745,7 +743,7 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
 
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PlayerScreenWithCode(
+        builder: (_) => PlayerScreen(
           joinCode: code,
           initialPlayerName: widget.playerName,
           initialTeam: widget.selectedTeam,

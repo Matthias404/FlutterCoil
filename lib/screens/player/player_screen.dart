@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../media_confic.dart';
 import '../../main.dart';
@@ -18,8 +19,8 @@ import '../../network/peer_directory.dart';
 import '../../network/transport.dart';
 import '../../network/udp_transport.dart';
 import '../../screens/player/gun_settings_screen.dart';
-import '../../screens/player/player_lobby_screen.dart';
 import '../../screens/player/lobby_rules_help_screen.dart';
+import '../../screens/player/player_lobby_screen.dart';
 import '../../theme/team_colors.dart';
 import '../../theme/theme_toggle_button.dart';
 import '../../utils/ble_gun_controller.dart';
@@ -32,7 +33,18 @@ import '../../utils/helpers.dart'
         teamBackgroundColors;
 
 class PlayerScreen extends StatefulWidget {
-  const PlayerScreen({super.key});
+  const PlayerScreen({
+    super.key,
+    this.joinCode,
+    this.initialPlayerName,
+    this.initialTeam,
+    this.autoJoinOnOpen = false,
+  });
+
+  final String? joinCode;
+  final String? initialPlayerName;
+  final String? initialTeam;
+  final bool autoJoinOnOpen;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -42,6 +54,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   static const int _playerPort = 7778;
   static const List<String> _teams = <String>['Red', 'Blue', 'Green', 'Yellow'];
   static const Duration _gunConnectTimeout = Duration(seconds: 8);
+  static const String _playerNamePrefKey = 'player_name';
+  static const String _selectedTeamPrefKey = 'selected_team';
 
   late final GameNetworkService _service;
   late final PeerDirectory _peerDirectory;
@@ -52,7 +66,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   late final AudioPlayer _gunSfxPlayer;
   String _gunShotAssetPath = MediaConfic.laserShot;
   String? _reloadSoundAssetPath;
-  String? _healSoundAssetPath;
   String? _modeSoundAssetPath;
   String? _hitSoundAssetPath;
   String? _recoilEnabledSoundAssetPath;
@@ -65,12 +78,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   StreamSubscription<GunBatteryLevel>? _gunBatterySub;
   StreamSubscription<GunTelemetrySample>? _gunTelemetrySub;
   StreamSubscription<Position>? _gpsSub;
+  late final Future<void> _bootstrapFuture;
   NetworkSnapshot? _snapshot;
   String _status = 'Fill in your player profile.';
   String _voiceStatus = 'Team voice ready.';
   bool _gunConnected = false;
   bool _showGunDisconnectedAlert = false;
   bool _showJoinCodeFallback = false;
+  bool _hasJoinedLobby = false;
   bool _isConnectingGun = false;
   bool _isRecordingVoice = false;
   bool _recoilEnabled = true;
@@ -89,6 +104,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int? _lastPowerCounter;
   int? _lastHitBy1Key;
   int? _lastHitBy2Key;
+
+  bool get _showAdvancedPlayerPanels => false;
 
   IconData _batteryIconForLevel(GunBatteryLevel? level) {
     switch (level) {
@@ -152,6 +169,69 @@ class _PlayerScreenState extends State<PlayerScreen> {
         duration: const Duration(milliseconds: 1200),
       ),
     );
+  }
+
+  Future<void> _openPlayerLobbyScreen() async {
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PlayerLobbyScreen(
+          service: _service,
+          initialTeam: _selectedTeam,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleEnterLobbyTap() async {
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      setState(() {
+        _status = 'Enter your player name before entering lobby.';
+      });
+      return;
+    }
+
+    if (_hasJoinedLobby) {
+      final isLobbyOpen = _snapshot?.lobbyOpen ?? false;
+      if (!isLobbyOpen) {
+        setState(() {
+          _status =
+              'Lobby is closed. Wait for the server to click Open Lobby.';
+        });
+        return;
+      }
+      await _openPlayerLobbyScreen();
+      return;
+    }
+
+    if (!_showJoinCodeFallback) {
+      setState(() {
+        _showJoinCodeFallback = true;
+        _status =
+            'Paste a lobby join code, then tap Enter Lobby to connect.';
+      });
+      return;
+    }
+
+    await _joinLobby();
+
+    if (!mounted) {
+      return;
+    }
+
+    final isLobbyOpen = _snapshot?.lobbyOpen ?? false;
+    if (!isLobbyOpen) {
+      setState(() {
+        _status =
+            'Connected, but lobby is closed. Wait for server to open lobby.';
+      });
+      return;
+    }
+
+    await _openPlayerLobbyScreen();
   }
 
   Future<void> _playGunShotSound() async {
@@ -229,9 +309,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _reloadSoundAssetPath = await _resolveFirstExistingAsset(
       MediaConfic.reloadCandidates,
     );
-    _healSoundAssetPath = await _resolveFirstExistingAsset(
-      MediaConfic.healCandidates,
-    );
     _modeSoundAssetPath = await _resolveFirstExistingAsset(
       MediaConfic.modeCandidates,
     );
@@ -258,10 +335,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _nameController = TextEditingController();
     _joinCodeController = TextEditingController();
+    final initialJoinCode = widget.joinCode?.trim();
+    if (initialJoinCode != null && initialJoinCode.isNotEmpty) {
+      _joinCodeController.text = initialJoinCode;
+      _showJoinCodeFallback = true;
+    }
     _peerDirectory = PeerDirectory();
     _voiceRecorder = AudioRecorder();
     _voicePlayer = AudioPlayer();
     _gunSfxPlayer = AudioPlayer();
+
+    // Use initial values from widget if provided
+    if (widget.initialTeam != null && _teams.contains(widget.initialTeam)) {
+      _selectedTeam = widget.initialTeam!;
+    }
 
     _service = GameNetworkService(
       transport: UdpNetworkTransport(localPort: _playerPort),
@@ -272,32 +359,115 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
 
     unawaited(_resolveGunActionAudioAssets());
-    _bootstrap();
-    _loadSavedGunProfile();
+    unawaited(_loadSavedPlayerName());
+    unawaited(_loadSavedTeamSelection());
+    _bootstrapFuture = _bootstrapSafely();
+    unawaited(_bootstrapFuture);
+    unawaited(_loadSavedGunProfile());
+
+    // Auto-join if join code and initial player name are provided
+    if (widget.joinCode != null && widget.autoJoinOnOpen) {
+      unawaited(_autoJoinLobby());
+    }
+  }
+
+  Future<void> _bootstrapSafely() async {
+    try {
+      await _bootstrap();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status =
+            'Network startup failed. You can still configure your gun and retry.';
+      });
+    }
+  }
+
+  Future<void> _loadSavedPlayerName() async {
+    final initialName = widget.initialPlayerName?.trim();
+    if (initialName != null && initialName.isNotEmpty) {
+      if (!mounted) {
+        return;
+      }
+      _nameController.text = initialName;
+      setState(() {});
+      return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final savedName = prefs.getString(_playerNamePrefKey)?.trim() ?? '';
+    if (!mounted || savedName.isEmpty) {
+      return;
+    }
+    _nameController.text = savedName;
+    setState(() {});
+  }
+
+  Future<void> _savePlayerName([String? value]) async {
+    final normalized = (value ?? _nameController.text).trim();
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized.isEmpty) {
+      await prefs.remove(_playerNamePrefKey);
+      return;
+    }
+    await prefs.setString(_playerNamePrefKey, normalized);
+  }
+
+  Future<void> _loadSavedTeamSelection() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedTeam = prefs.getString(_selectedTeamPrefKey);
+    if (!mounted || savedTeam == null || !_teams.contains(savedTeam)) {
+      return;
+    }
+
+    setState(() {
+      _selectedTeam = savedTeam;
+    });
+
+    await _service.updateLocalProfile(group: savedTeam, gunConnected: _gunConnected);
+  }
+
+  Future<void> _saveSelectedTeam(String team) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_selectedTeamPrefKey, team);
   }
 
   Future<void> _loadSavedGunProfile() async {
-    final profile = await GunProfileStorage.load();
-    final gunConnected =
-        profile != null &&
-        BleGunController.isConnected(deviceId: profile.deviceId);
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _savedGunProfile = profile;
-      _recoilEnabled = profile?.recoilEnabled ?? true;
-      _gunConnected = gunConnected;
-      _showGunDisconnectedAlert = false;
-      if (!gunConnected) {
-        _status = 'Connect last gun or open Gun Settings to pair a gun.';
+    try {
+      final profile = await GunProfileStorage.load();
+      final gunConnected =
+          profile != null &&
+          BleGunController.isConnected(deviceId: profile.deviceId);
+      if (!mounted) {
+        return;
       }
-    });
+      setState(() {
+        _savedGunProfile = profile;
+        _recoilEnabled = profile?.recoilEnabled ?? true;
+        _gunConnected = gunConnected;
+        _showGunDisconnectedAlert = false;
+        if (!gunConnected) {
+          _status = 'Connect last gun or open Gun Settings to pair a gun.';
+        }
+      });
 
-    if (profile != null && gunConnected) {
-      await _startGunConnectionMonitoring(profile);
-      await _startBatteryMonitoring(profile);
-      await _startTelemetryMonitoring(profile);
+      if (profile != null && gunConnected) {
+        await _startGunConnectionMonitoring(profile);
+        await _startBatteryMonitoring(profile);
+        await _startTelemetryMonitoring(profile);
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _savedGunProfile = null;
+        _gunConnected = false;
+        _showGunDisconnectedAlert = false;
+        _status = 'Could not load saved gun profile. Open Gun Settings to pair.';
+      });
     }
   }
 
@@ -307,6 +477,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       setState(() {
         _status = 'Enter your player name before searching for games.';
       });
+      return;
+    }
+
+    await _savePlayerName(name);
+    if (!mounted) {
       return;
     }
 
@@ -336,20 +511,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // A selected game opens its own join flow; do not open lobby from here.
   }
 
-  Future<void> _openLobbyScreen() async {
-    if (!mounted) {
-      return;
-    }
 
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => PlayerLobbyScreen(
-          service: _service,
-          initialTeam: _selectedTeam,
-        ),
-      ),
-    );
-  }
 
   Future<void> _startGunConnectionMonitoring(GunProfile profile) async {
     await _gunConnectionSub?.cancel();
@@ -602,12 +764,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
       await _service.updateLocalProfile(gunConnected: false);
     } finally {
-      if (!mounted) {
-        return;
+      if (mounted) {
+        setState(() {
+          _isConnectingGun = false;
+        });
       }
-      setState(() {
-        _isConnectingGun = false;
-      });
     }
   }
 
@@ -759,7 +920,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (newBombs.isNotEmpty) {
         unawaited(_playOptionalActionSound(MediaConfic.bombDropping));
         Future<void>.delayed(const Duration(seconds: 7)).then((_) {
-          if (mounted) unawaited(_playOptionalActionSound(MediaConfic.explosion));
+          if (mounted) {
+            unawaited(_playOptionalActionSound(MediaConfic.explosion));
+          }
         });
       }
 
@@ -976,6 +1139,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    await _savePlayerName(name);
+
     PeerEndpoint serverEndpoint;
     try {
       serverEndpoint = JoinCodeCodec.decode(joinCode);
@@ -988,23 +1153,94 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
 
+    await _bootstrapFuture;
+
     await _service.updateLocalProfile(
       name: name,
       group: _selectedTeam,
       gunConnected: _gunConnected,
     );
-    unawaited(_service.connect());
+    try {
+      await _service.connect();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status =
+            'Could not connect to lobby. Check join code/network and try again.';
+      });
+      return;
+    }
 
     if (!mounted) {
       return;
     }
 
     setState(() {
+      _hasJoinedLobby = true;
       _status =
-          'Joining lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
+          'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
     });
+  }
 
-    await _openLobbyScreen();
+  Future<void> _autoJoinLobby() async {
+    final joinCode = widget.joinCode;
+    if (joinCode == null) {
+      return;
+    }
+
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      setState(() {
+        _status = 'Enter your player name before joining.';
+      });
+      return;
+    }
+
+    await _savePlayerName(name);
+
+    PeerEndpoint serverEndpoint;
+    try {
+      serverEndpoint = JoinCodeCodec.decode(joinCode);
+    } on FormatException catch (error) {
+      setState(() {
+        _status = 'Invalid join code: ${error.message}';
+      });
+      return;
+    }
+
+    _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
+
+    await _bootstrapFuture;
+
+    await _service.updateLocalProfile(
+      name: name,
+      group: _selectedTeam,
+      gunConnected: _gunConnected,
+    );
+    try {
+      await _service.connect();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status =
+            'Could not connect to lobby. Check join code/network and try again.';
+      });
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _hasJoinedLobby = true;
+      _status =
+          'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
+    });
   }
 
   Future<void> _handleTeamSelectionChanged(
@@ -1018,6 +1254,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     setState(() {
       _selectedTeam = team;
     });
+    await _saveSelectedTeam(team);
 
     if (!hasJoinedLobby) {
       return;
@@ -1139,8 +1376,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                const Icon(Icons.local_fire_department,
-                    color: Colors.redAccent, size: 28),
+                const Icon(
+                  Icons.local_fire_department,
+                  color: Colors.redAccent,
+                  size: 28,
+                ),
                 const SizedBox(width: 12),
                 Flexible(
                   child: Text(
@@ -1242,7 +1482,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     const Text(
                       'Connect Gun',
                       textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Text(
@@ -1297,14 +1540,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
     final panelTextColor = teamPalette.foreground(brightness);
     final panelSecondaryTextColor = panelTextColor.withValues(alpha: 0.82);
-    final teamFilledButtonStyle = FilledButton.styleFrom(
-      backgroundColor: teamPalette.primary.withValues(
-        alpha: brightness == Brightness.dark ? 0.88 : 0.9,
-      ),
-      foregroundColor: teamPalette.foreground(brightness),
-      elevation: 6,
-      shadowColor: teamPalette.primary.withValues(alpha: 0.45),
-    );
     final teamSecondaryFilledButtonStyle = FilledButton.styleFrom(
       backgroundColor: teamPalette.secondary.withValues(
         alpha: brightness == Brightness.dark ? 0.72 : 0.82,
@@ -1322,7 +1557,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       side: const BorderSide(color: Colors.white70),
     );
     final localPlayer = snapshot?.players[_service.localPlayerId];
-    final hasJoinedLobby = snapshot?.serverPlayerId != null;
+    final hasJoinedLobby = _hasJoinedLobby;
+    final isServerLobbyOpen = snapshot?.lobbyOpen ?? false;
     final isFreeForAll =
         (snapshot?.lobbyRules.gameType ?? GameType.time) == GameType.freeForAll;
     final countdownStarted =
@@ -1344,7 +1580,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         teamBuckets[team] = <PlayerState>[];
       }
       for (final player in lobbyPlayers) {
-        teamBuckets.putIfAbsent(player.group, () => <PlayerState>[]).add(player);
+        teamBuckets
+            .putIfAbsent(player.group, () => <PlayerState>[])
+            .add(player);
       }
     }
     final localPlayerName = localPlayer?.name.isNotEmpty == true
@@ -1354,8 +1592,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         : 'Player';
     final hasPlayerName = _nameController.text.trim().isNotEmpty;
     final localGunMode = _savedGunProfile == null
-      ? 'No gun profile'
-      : '${_savedGunProfile!.selectedFireMode.label} • Recoil ${_savedGunProfile!.recoilEnabled ? 'on' : 'off'}';
+        ? 'No gun profile'
+        : '${_savedGunProfile!.selectedFireMode.label} • Recoil ${_savedGunProfile!.recoilEnabled ? 'on' : 'off'}';
     final compactTextTheme = Theme.of(
       context,
     ).textTheme.apply(fontSizeFactor: 0.9);
@@ -1427,16 +1665,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                         ),
                                         items: _teams
                                             .map(
-                                              (team) => DropdownMenuItem<String>(
-                                                value: team,
-                                                child: Row(
-                                                  children: <Widget>[
-                                                    _teamIcon(team),
-                                                    const SizedBox(width: 8),
-                                                    Text(team),
-                                                  ],
-                                                ),
-                                              ),
+                                              (team) =>
+                                                  DropdownMenuItem<String>(
+                                                    value: team,
+                                                    child: Row(
+                                                      children: <Widget>[
+                                                        _teamIcon(team),
+                                                        const SizedBox(
+                                                          width: 8,
+                                                        ),
+                                                        Text(team),
+                                                      ],
+                                                    ),
+                                                  ),
                                             )
                                             .toList(),
                                         onChanged: canChangeTeam
@@ -1445,7 +1686,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                                   unawaited(
                                                     _handleTeamSelectionChanged(
                                                       team,
-                                                      hasJoinedLobby: hasJoinedLobby,
+                                                      hasJoinedLobby:
+                                                          hasJoinedLobby,
                                                     ),
                                                   );
                                                 }
@@ -1457,27 +1699,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                       const Text('No players connected yet.')
                                     else
                                       ...teamBuckets.entries
-                                          .where((entry) => entry.value.isNotEmpty)
+                                          .where(
+                                            (entry) => entry.value.isNotEmpty,
+                                          )
                                           .expand(
                                             (entry) => <Widget>[
                                               if (!isFreeForAll)
                                                 Padding(
-                                                  padding: const EdgeInsets.only(
-                                                    top: 6,
-                                                    bottom: 4,
-                                                  ),
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                        top: 6,
+                                                        bottom: 4,
+                                                      ),
                                                   child: Text(
                                                     'Team ${entry.key}',
                                                     style: const TextStyle(
-                                                      fontWeight: FontWeight.w700,
+                                                      fontWeight:
+                                                          FontWeight.w700,
                                                     ),
                                                   ),
                                                 ),
                                               ...entry.value.map(
                                                 (player) => Padding(
-                                                  padding: const EdgeInsets.only(
-                                                    bottom: 4,
-                                                  ),
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                        bottom: 4,
+                                                      ),
                                                   child: Row(
                                                     children: <Widget>[
                                                       player.isHost
@@ -1487,7 +1734,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                                             )
                                                           : const SizedBox.shrink(),
                                                       player.isHost
-                                                          ? const SizedBox(width: 4)
+                                                          ? const SizedBox(
+                                                              width: 4,
+                                                            )
                                                           : const SizedBox.shrink(),
                                                       Expanded(
                                                         child: Text(
@@ -1525,14 +1774,265 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     border: Border.all(color: textPanelBorder),
                                     borderRadius: BorderRadius.circular(10),
                                   ),
-                                  child: Text(
-                                    'Status: $_status',
-                                    style: TextStyle(color: panelTextColor),
-                                    maxLines: compact ? 2 : 3,
-                                    overflow: TextOverflow.ellipsis,
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        'Gun mode: $localGunMode',
+                                        style: TextStyle(
+                                          color: panelTextColor,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Row(
+                                        children: <Widget>[
+                                          Icon(
+                                            _batteryIconForLevel(
+                                              _gunBatteryLevel,
+                                            ),
+                                            size: 16,
+                                            color: _batteryColorForLevel(
+                                              _gunBatteryLevel,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            'Battery: ${_batteryLabelForLevel(_gunBatteryLevel)}',
+                                            style: TextStyle(
+                                              color: panelSecondaryTextColor,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ),
                                 ),
                                 const SizedBox(height: 8),
+                                TextField(
+                                  controller: _nameController,
+                                  onChanged: (value) {
+                                    setState(() {});
+                                    unawaited(_savePlayerName(value));
+                                  },
+                                  decoration: InputDecoration(
+                                    isDense: compact,
+                                    labelText: 'Player name',
+                                    border: const OutlineInputBorder(),
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: <Widget>[
+                                    Expanded(
+                                      child: OutlinedButton.icon(
+                                        style: teamOutlinedButtonStyle,
+                                        onPressed: _searchLanAndHandleFallback,
+                                        icon: const Icon(Icons.wifi_find),
+                                        label: const Text('Search LAN'),
+                                      ),
+                                    ),
+                                    if (hasPlayerName) ...<Widget>[
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: FilledButton.icon(
+                                          style: teamSecondaryFilledButtonStyle,
+                                          onPressed: () {
+                                            unawaited(_handleEnterLobbyTap());
+                                          },
+                                          icon: const Icon(Icons.login),
+                                          label: const Text('Enter Lobby'),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                DropdownButtonFormField<String>(
+                                  initialValue: _selectedTeam,
+                                  isDense: compact,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Team',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  items: _teams
+                                      .map(
+                                        (team) => DropdownMenuItem<String>(
+                                          value: team,
+                                          child: Row(
+                                            children: <Widget>[
+                                              _teamIcon(team),
+                                              const SizedBox(width: 8),
+                                              Text(team),
+                                            ],
+                                          ),
+                                        ),
+                                      )
+                                      .toList(),
+                                  onChanged: canChangeTeam
+                                      ? (team) {
+                                          if (team != null) {
+                                            unawaited(
+                                              _handleTeamSelectionChanged(
+                                                team,
+                                                hasJoinedLobby: hasJoinedLobby,
+                                              ),
+                                            );
+                                          }
+                                        }
+                                      : null,
+                                ),
+                                if (hasJoinedLobby) ...<Widget>[
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: textPanelBg,
+                                      border: Border.all(color: textPanelBorder),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: <Widget>[
+                                        Text(
+                                          'Game Rules',
+                                          style: TextStyle(
+                                            color: panelTextColor,
+                                            fontWeight: FontWeight.w700,
+                                            fontSize: 14,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          'Type: ${snapshot?.lobbyRules.gameType.label ?? "Unknown"}',
+                                          style: TextStyle(
+                                            color: panelSecondaryTextColor,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          'Duration: ${snapshot?.lobbyRules.matchLengthMinutes ?? 0} minutes',
+                                          style: TextStyle(
+                                            color: panelSecondaryTextColor,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        SizedBox(
+                                          width: double.infinity,
+                                          child: FilledButton.icon(
+                                            style: teamSecondaryFilledButtonStyle,
+                                            onPressed: () {
+                                              Navigator.of(context).push(
+                                                MaterialPageRoute<void>(
+                                                  builder: (_) =>
+                                                      LobbyRulesHelpScreen(
+                                                        rules:
+                                                            snapshot
+                                                                    ?.lobbyRules ??
+                                                            const LobbyRules
+                                                                .defaults(),
+                                                      ),
+                                                ),
+                                              );
+                                            },
+                                            icon: const Icon(Icons.info),
+                                            label: const Text(
+                                                'View Full Rules Explanation'),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: textPanelBg,
+                                      border: Border.all(color: textPanelBorder),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: <Widget>[
+                                        Text(
+                                          'Items Available',
+                                          style: TextStyle(
+                                            color: panelTextColor,
+                                            fontWeight: FontWeight.w700,
+                                            fontSize: 14,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        ...ItemRegistry.definitions.values
+                                            .map(
+                                              (item) => Padding(
+                                                padding:
+                                                    const EdgeInsets.only(
+                                                      bottom: 6,
+                                                    ),
+                                                child: Row(
+                                                  children: <Widget>[
+                                                    Icon(
+                                                      Icons.inventory_2,
+                                                      size: 14,
+                                                      color:
+                                                          panelSecondaryTextColor,
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    Expanded(
+                                                      child: Text(
+                                                        item.name,
+                                                        style: TextStyle(
+                                                          color:
+                                                              panelSecondaryTextColor,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: FilledButton.icon(
+                                      style: teamSecondaryFilledButtonStyle,
+                                      onPressed: isServerLobbyOpen
+                                          ? () {
+                                              unawaited(
+                                                _openPlayerLobbyScreen(),
+                                              );
+                                            }
+                                          : null,
+                                      icon: const Icon(Icons.login),
+                                      label: const Text('Enter Lobby'),
+                                    ),
+                                  ),
+                                  if (!isServerLobbyOpen) ...<Widget>[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      'Lobby is currently closed. Wait for server to click Open Lobby.',
+                                      style: TextStyle(
+                                        color: panelSecondaryTextColor,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                                if (_showAdvancedPlayerPanels) ...<Widget>[
+                                  const SizedBox(height: 8),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 10,
@@ -1588,18 +2088,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     style: TextStyle(color: panelTextColor),
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                TextField(
-                                  controller: _nameController,
-                                  onChanged: (_) {
-                                    setState(() {});
-                                  },
-                                  decoration: InputDecoration(
-                                    isDense: compact,
-                                    labelText: 'Player name',
-                                    border: const OutlineInputBorder(),
                                   ),
                                 ),
                                 const SizedBox(height: 8),
@@ -1713,33 +2201,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     ),
                                   ),
                                   const SizedBox(height: 8),
+                                  FilledButton.icon(
+                                    style: teamSecondaryFilledButtonStyle,
+                                    onPressed: hasPlayerName
+                                        ? () {
+                                            unawaited(_handleEnterLobbyTap());
+                                          }
+                                        : null,
+                                    icon: const Icon(Icons.login),
+                                    label: const Text('Enter Lobby'),
+                                  ),
+                                  const SizedBox(height: 8),
                                 ],
-                                Row(
-                                  children: <Widget>[
-                                    Expanded(
-                                      child: OutlinedButton.icon(
-                                        style: teamOutlinedButtonStyle,
-                                        onPressed: _searchLanAndHandleFallback,
-                                        icon: const Icon(Icons.wifi_find),
-                                        label: const Text('Search LAN'),
-                                      ),
-                                    ),
-                                    if (hasPlayerName) ...<Widget>[
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: FilledButton.icon(
-                                          style: teamFilledButtonStyle,
-                                          onPressed: _showJoinCodeFallback
-                                              ? _joinLobby
-                                              : null,
-                                          icon: const Icon(Icons.login),
-                                          label: const Text('Join Lobby'),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                                const SizedBox(height: 8),
                                 OutlinedButton.icon(
                                   style: teamOutlinedButtonStyle,
                                   onPressed: _toggleTeamVoice,
@@ -1776,6 +2249,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 ),
                                 const SizedBox(height: 8),
                                 infoPanels,
+                                ],
                               ],
                             ),
                           ),

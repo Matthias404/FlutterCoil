@@ -162,7 +162,7 @@ class PlayerResultsScreen extends StatelessWidget {
                             ],
                           ),
                           subtitle: Text(
-                            'Team ${player.group} • Hits ${player.hitsTaken} • Shots ${player.shotsFired}',
+                            'Team ${player.group} • Kills ${player.kills} • Hits ${player.hitsLanded} • Taken ${player.hitsTaken} • Shots ${player.shotsFired}',
                             style: const TextStyle(color: Colors.white70),
                           ),
                           trailing: Text(

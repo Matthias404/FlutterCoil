@@ -16,8 +16,6 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../../media_confic.dart';
 import '../../network/game_network_service.dart';
 import '../../network/item_definitions.dart';
-import '../../network/item_models.dart';
-import '../../network/player_state.dart';
 import '../../screens/player/gun_settings_screen.dart';
 import '../../screens/player/player_results_screen.dart';
 import '../../theme/team_colors.dart';
@@ -285,9 +283,9 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
     // Initialise timer length from server rules.
     final rules = widget.service.snapshot.lobbyRules;
-    _timeRemaining = rules.matchLengthMinutes * 60;
     _livesLeft = rules.maxLives;
     _snapshot = widget.service.snapshot;
+    _timeRemaining = _computeSynchronizedTimeRemaining(_snapshot!);
 
     _snapshotSub = widget.service.updates.listen(_onSnapshotUpdate);
     _killEventSub = widget.service.killEvents.listen(_onKillEvent);
@@ -389,6 +387,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       _snapshot = snapshot;
       if (snapshot.gamePhase == GamePhase.running) {
         _isGameRunning = true;
+        _timeRemaining = _computeSynchronizedTimeRemaining(snapshot);
       }
       if (local != null) {
         _livesLeft = (maxLives - local.hitsTaken).clamp(0, maxLives);
@@ -398,6 +397,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         }
       }
       if (snapshot.gamePhase == GamePhase.ended && _isGameRunning) {
+        _timeRemaining = 0;
         _isGameRunning = false;
       }
     });
@@ -511,7 +511,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     }
 
     final targetName =
-      snapshot.players[strikeEffect.playerId]?.name ?? 'Player';
+        snapshot.players[strikeEffect.playerId]?.name ?? 'Player';
     final next = _PendingAirStrike(
       targetId: targetName,
       resolveAt: strikeEffect.expiresAt!,
@@ -802,7 +802,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     if (!mounted) {
       return;
     }
-
   }
 
   Future<void> _onHitFromGun(int shooterId) async {
@@ -1153,6 +1152,18 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       _radarSweepDegrees = (_radarSweepDegrees + 18) % 360;
       _tickEffectTimers();
 
+      final snapshot = _snapshot;
+      if (snapshot != null && snapshot.gamePhase == GamePhase.running) {
+        final synchronizedRemaining = _computeSynchronizedTimeRemaining(
+          snapshot,
+        );
+        if (_timeRemaining != synchronizedRemaining) {
+          setState(() {
+            _timeRemaining = synchronizedRemaining;
+          });
+        }
+      }
+
       // Stop the local countdown when the server ends the game.
       final serverPhase = _snapshot?.gamePhase;
       if (serverPhase == GamePhase.ended) {
@@ -1167,7 +1178,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         return;
       }
 
-      if (_timeRemaining <= 1) {
+      if (_timeRemaining <= 0) {
         setState(() {
           _timeRemaining = 0;
           _isGameRunning = false;
@@ -1176,11 +1187,31 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         timer.cancel();
         return;
       }
-
-      setState(() {
-        _timeRemaining -= 1;
-      });
     });
+  }
+
+  int _computeSynchronizedTimeRemaining(NetworkSnapshot snapshot) {
+    final totalSeconds = snapshot.lobbyRules.matchLengthMinutes * 60;
+    if (snapshot.gamePhase != GamePhase.running) {
+      return totalSeconds;
+    }
+
+    final startedAt = snapshot.gameStartedAt;
+    if (startedAt == null) {
+      return _timeRemaining.clamp(0, totalSeconds);
+    }
+
+    final elapsedSeconds = widget.service.synchronizedNow
+        .difference(startedAt)
+        .inSeconds;
+    final remaining = totalSeconds - elapsedSeconds;
+    if (remaining <= 0) {
+      return 0;
+    }
+    if (remaining > totalSeconds) {
+      return totalSeconds;
+    }
+    return remaining;
   }
 
   void _tickEffectTimers() {
@@ -1348,7 +1379,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       unawaited(_armGunForMatch(profile));
       return;
     }
-
   }
 
   Future<void> _toggleRecoilFromPowerButton() async {
@@ -2052,15 +2082,17 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
                                             Expanded(
                                               child: Text(
                                                 'Score ${widget.service.localPlayer.score}\n'
+                                                'Kills ${widget.service.localPlayer.kills}\n'
+                                                'Hits ${widget.service.localPlayer.hitsLanded}\n'
                                                 'Shots ${widget.service.localPlayer.shotsFired}\n'
-                                                'Hits ${widget.service.localPlayer.hitsTaken}\n'
+                                                'Taken ${widget.service.localPlayer.hitsTaken}\n'
                                                 'Items ${_snapshot?.items.length ?? 0}\n'
                                                 'AmmoBoost ${_noReloadExpiresAt != null && DateTime.now().isBefore(_noReloadExpiresAt!) ? 'On' : 'Off'}',
                                                 style: const TextStyle(
                                                   color: Colors.white,
                                                   fontSize: 12,
                                                 ),
-                                                maxLines: 5,
+                                                maxLines: 7,
                                               ),
                                             ),
                                           ],
@@ -2240,10 +2272,7 @@ class _ItemPickupOverlay {
 }
 
 class _PendingAirStrike {
-  const _PendingAirStrike({
-    required this.targetId,
-    required this.resolveAt,
-  });
+  const _PendingAirStrike({required this.targetId, required this.resolveAt});
 
   final String targetId;
   final DateTime resolveAt;

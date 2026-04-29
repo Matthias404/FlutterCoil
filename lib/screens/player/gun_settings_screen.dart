@@ -204,8 +204,19 @@ class _GunSettingsScreenState extends State<GunSettingsScreen> {
       return;
     }
 
-    final isBluetoothOn =
-        await FlutterBluePlus.adapterState.first == BluetoothAdapterState.on;
+    bool isBluetoothOn;
+    try {
+      isBluetoothOn =
+          await FlutterBluePlus.adapterState.first == BluetoothAdapterState.on;
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not access Bluetooth state: $e')),
+      );
+      return;
+    }
     if (!isBluetoothOn) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

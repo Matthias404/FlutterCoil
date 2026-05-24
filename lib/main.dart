@@ -515,6 +515,7 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
         playerId: 'browse-${DateTime.now().microsecondsSinceEpoch}',
         playerName: 'LAN Browser',
         payload: const <String, dynamic>{
+          'browserProbe': true,
           'group': 'Browser',
           'playerClass': 'Assult',
           'gunConnected': false,

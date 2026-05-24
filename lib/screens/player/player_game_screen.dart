@@ -42,6 +42,8 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   static const int _autoShotsPerTriggerPress = 1;
   static const Duration _burstShotInterval = Duration(milliseconds: 90);
   static const Duration _autoShotInterval = Duration(milliseconds: 70);
+  static const Duration _singleShotCooldown = Duration(milliseconds: 140);
+  static const Duration _burstSequenceCooldown = Duration(milliseconds: 240);
   static const Duration _autoReconnectCooldown = Duration(seconds: 2);
   static const int _recoilTriggerButtonBit = 0x01;
   static const double _radarRangeMeters = 80;
@@ -102,12 +104,16 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   bool _gunConnected = false;
   bool _showGunDisconnectedAlert = false;
   bool _didNavigateToResults = false;
+  String? _gunReconnectDiagnostic;
+  void Function(String message)? _previousDiagnosticsLogger;
+  void Function(String message)? _screenDiagnosticsLogger;
   int? _lastTriggerCounter;
   int? _lastReloadCounter;
   int? _lastStartCounter;
   int? _lastRecoilPlayerIdReported;
   int? _lastHitBy1Key;
   int? _lastHitBy2Key;
+  DateTime? _nextManualFireAllowedAt;
 
   void _navigateToResultsIfNeeded([NetworkSnapshot? snapshot]) {
     if (!mounted || _didNavigateToResults) {
@@ -276,6 +282,17 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   @override
   void initState() {
     super.initState();
+    _previousDiagnosticsLogger = BleGunController.diagnosticsLogger;
+    _screenDiagnosticsLogger = (message) {
+      _previousDiagnosticsLogger?.call(message);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _gunReconnectDiagnostic = message;
+      });
+    };
+    BleGunController.diagnosticsLogger = _screenDiagnosticsLogger;
     unawaited(WakelockPlus.enable());
     _teamVoiceRecorder = AudioRecorder();
     _teamVoicePlayer = AudioPlayer();
@@ -301,6 +318,9 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
   @override
   void dispose() {
+    if (identical(BleGunController.diagnosticsLogger, _screenDiagnosticsLogger)) {
+      BleGunController.diagnosticsLogger = _previousDiagnosticsLogger;
+    }
     unawaited(WakelockPlus.disable());
     _matchTimer?.cancel();
     _reloadTimer?.cancel();
@@ -343,11 +363,23 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
     await _startGunConnectionMonitoring(profile);
     if (gunConnected) {
-      await _startBatteryMonitoring(profile);
-      await _startTelemetryMonitoring(profile);
-      await _applyShotModeToGun(profile);
-      await _applyRecoilModeToGun(profile);
-      await _armGunForMatch(profile);
+      try {
+        await _startBatteryMonitoring(profile);
+        await _startTelemetryMonitoring(profile);
+        await _applyShotModeToGun(profile);
+        await _applyRecoilModeToGun(profile);
+        await _armGunForMatch(profile);
+      } catch (_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _gunConnected = false;
+          _showGunDisconnectedAlert = true;
+          _gunBatteryLevel = null;
+        });
+        _scheduleAutoReconnect();
+      }
     } else {
       _scheduleAutoReconnect();
     }
@@ -414,6 +446,12 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       if (respawnedNow && _keepKillOverlayUntilRespawn) {
         _killOverlayMessage = null;
         _keepKillOverlayUntilRespawn = false;
+      }
+
+      if (respawnedNow) {
+        _ammoLeft = _startingAmmo;
+        _isReloading = false;
+        _stopAutoFireLoop();
       }
     });
 
@@ -600,11 +638,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
                 _gunConnected = true;
                 _showGunDisconnectedAlert = false;
               });
-              unawaited(_startBatteryMonitoring(profile));
-              unawaited(_startTelemetryMonitoring(profile));
-              unawaited(_applyShotModeToGun(profile));
-              unawaited(_applyRecoilModeToGun(profile));
-              unawaited(_armGunForMatch(profile));
+              unawaited(_recoverOnReconnect(profile));
             }
             return;
           }
@@ -621,7 +655,48 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
             unawaited(_gunTelemetrySub?.cancel());
             _scheduleAutoReconnect();
           }
+        }, onError: (_) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _gunConnected = false;
+            _showGunDisconnectedAlert = true;
+            _gunBatteryLevel = null;
+          });
+          _scheduleAutoReconnect();
         });
+  }
+
+  Future<void> _recoverOnReconnect(GunProfile profile) async {
+    try {
+      // Power-cycled guns can keep stale GATT state on the phone side.
+      // Force a fresh BLE session before re-subscribing telemetry/commands.
+      try {
+        await BleGunController.disconnect(deviceId: profile.deviceId);
+      } catch (_) {
+        // Best effort only; continue with fresh connect attempt.
+      }
+      BleGunController.clearCachedHandles(deviceId: profile.deviceId);
+      await BleGunController.connect(deviceId: profile.deviceId);
+      await _startBatteryMonitoring(profile);
+      await _startTelemetryMonitoring(profile);
+      await _applyShotModeToGun(profile);
+      await _applyRecoilModeToGun(profile);
+      await _armGunForMatch(profile);
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _gunConnected = false;
+        _showGunDisconnectedAlert = true;
+        _gunBatteryLevel = null;
+      });
+      _scheduleAutoReconnect();
+    }
+            unawaited(_gunBatterySub?.cancel());
+            BleGunController.clearCachedHandles(deviceId: profile.deviceId);
   }
 
   Future<void> _startBatteryMonitoring(GunProfile profile) async {
@@ -633,6 +708,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
               return;
             }
             setState(() {
+          BleGunController.clearCachedHandles(deviceId: profile.deviceId);
               _gunBatteryLevel = level;
             });
           },
@@ -712,6 +788,16 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
           // Keep ammo accounting local in test mode so rounds are consumed only
           // when this screen confirms a shot event per selected fire mode.
+        }, onError: (_) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _gunConnected = false;
+            _showGunDisconnectedAlert = true;
+            _gunBatteryLevel = null;
+          });
+          _scheduleAutoReconnect();
         });
   }
 
@@ -758,6 +844,14 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       return;
     }
 
+    if (mode != FireMode.auto) {
+      final now = DateTime.now();
+      final nextAllowedAt = _nextManualFireAllowedAt;
+      if (nextAllowedAt != null && now.isBefore(nextAllowedAt)) {
+        return;
+      }
+    }
+
     final hasUnlimitedAmmo =
         _noReloadExpiresAt != null &&
         DateTime.now().isBefore(_noReloadExpiresAt!);
@@ -786,6 +880,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     }
 
     _isFiringSequence = true;
+    var shotsFiredInSequence = 0;
     try {
       for (var i = 0; i < shotsToFire; i++) {
         if (!mounted || _isReloading) {
@@ -800,6 +895,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         if (!shotFired) {
           break;
         }
+        shotsFiredInSequence += 1;
 
         final profile = _savedGunProfile;
         if (profile != null && _gunConnected) {
@@ -809,6 +905,15 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         if (i < shotsToFire - 1 && spacing > Duration.zero) {
           await Future<void>.delayed(spacing);
         }
+      }
+
+      if (mode == FireMode.single && shotsFiredInSequence > 0) {
+        _nextManualFireAllowedAt = DateTime.now().add(_singleShotCooldown);
+      } else if (mode == FireMode.burst3 &&
+          shotsFiredInSequence == shotsToFire) {
+        _nextManualFireAllowedAt = DateTime.now().add(
+          _burstSequenceCooldown,
+        );
       }
     } finally {
       _isFiringSequence = false;
@@ -959,6 +1064,19 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
                           height: 1.35,
                         ),
                       ),
+                      if (_gunReconnectDiagnostic != null) ...<Widget>[
+                        const SizedBox(height: 10),
+                        Text(
+                          _gunReconnectDiagnostic!,
+                          textAlign: TextAlign.center,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 18),
                       FilledButton.icon(
                         onPressed: _reconnectGun,

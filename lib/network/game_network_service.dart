@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'item_definitions.dart';
@@ -116,29 +117,29 @@ class LobbyRules {
     this.respawnMode = RespawnMode.onDeath,
     this.baseRadiusMeters = 2.0,
     this.hillRadiusMeters = 2.0,
-    required this.friendlyFire,
-    required this.allowMidGameJoin,
-    required this.teamLeadVoiceOnly,
+    this.friendlyFire = false,
+    this.allowMidGameJoin = true,
+    this.teamLeadVoiceOnly = false,
     this.showOtherPlayersOnMap = true,
   });
 
   const LobbyRules.defaults()
-    : gameType = GameType.time,
-      firingEnvironment = FiringEnvironment.outdoor,
-      magazineSize = 15,
-      reloadTimeSeconds = 2,
-      maxLives = 10,
-      matchLengthMinutes = 10,
-      maxPlayers = 6,
-      respawnDelaySeconds = 5,
-      itemSpawnRateSeconds = 30,
-      respawnMode = RespawnMode.onDeath,
-      baseRadiusMeters = 2.0,
-      hillRadiusMeters = 2.0,
-      friendlyFire = false,
-      allowMidGameJoin = true,
-      teamLeadVoiceOnly = true,
-      showOtherPlayersOnMap = true;
+      : gameType = GameType.time,
+        firingEnvironment = FiringEnvironment.outdoor,
+        magazineSize = 15,
+        reloadTimeSeconds = 2,
+        maxLives = 10,
+        matchLengthMinutes = 10,
+        maxPlayers = 20,
+        respawnDelaySeconds = 5,
+        itemSpawnRateSeconds = 30,
+        respawnMode = RespawnMode.onDeath,
+        baseRadiusMeters = 2.0,
+        hillRadiusMeters = 2.0,
+        friendlyFire = false,
+        allowMidGameJoin = true,
+        teamLeadVoiceOnly = false,
+        showOtherPlayersOnMap = true;
 
   final GameType gameType;
   final FiringEnvironment firingEnvironment;
@@ -313,6 +314,22 @@ class _PreservedPlayerStats {
   final int hitsTaken;
 }
 
+class _PendingReliableSend {
+  _PendingReliableSend({
+    required this.host,
+    required this.port,
+    required this.packet,
+    required this.key,
+  });
+
+  final String host;
+  final int port;
+  final NetworkPacket packet;
+  final String key;
+  int attempts = 0;
+  Timer? retryTimer;
+}
+
 class GameNetworkService {
   GameNetworkService({
     required this.transport,
@@ -347,6 +364,11 @@ class GameNetworkService {
   final Map<String, _PreservedPlayerStats> _preservedStatsByPlayerId =
       <String, _PreservedPlayerStats>{};
   final Map<String, int> _staleConnectionChecksByPlayerId = <String, int>{};
+  final Map<String, String> _endpointKeyByPlayerId = <String, String>{};
+    final Map<String, _PendingReliableSend> _pendingReliableSendsByKey =
+      <String, _PendingReliableSend>{};
+    final Map<String, DateTime> _processedHitEventIds = <String, DateTime>{};
+    final Map<String, DateTime> _processedShotEventIds = <String, DateTime>{};
   StreamSubscription<DatagramEnvelope>? _sub;
   Timer? _scheduledStartTriggerTimer;
   Timer? _scheduledStartTimer;
@@ -354,12 +376,25 @@ class GameNetworkService {
   Timer? _connectionCheckTimer;
   Timer? _keepAliveTimer;
   Timer? _serverItemTickTimer;
+  Timer? _stateBroadcastTickTimer;
+  bool _stateBroadcastDirty = false;
+  bool _stateBroadcastInFlight = false;
+  bool _stateBroadcastUrgentPending = false;
   static const Duration _disconnectionGracePeriod = Duration(seconds: 30);
   static const Duration _keepAliveInterval = Duration(seconds: 4);
   static const Duration _connectionCheckInterval = Duration(seconds: 5);
+  static const Duration _stateBroadcastTickInterval = Duration(
+    milliseconds: 125,
+  );
+  static const Duration _reliableRetryInterval = Duration(milliseconds: 120);
+  static const int _reliableMaxAttempts = 4;
   static const Duration _disconnectInactivityThreshold = Duration(seconds: 20);
   static const int _disconnectMissedChecksRequired = 2;
   static const Duration _itemTickInterval = Duration(seconds: 1);
+  static const Duration _gpsBroadcastMinInterval = Duration(seconds: 3);
+  static const double _gpsBroadcastMinDistanceMeters = 2.5;
+  static const Duration _hitEventDedupTtl = Duration(seconds: 8);
+  static const Duration _shotEventDedupTtl = Duration(seconds: 8);
   static const Duration _pickupNotificationTtl = Duration(seconds: 5);
   static const double _itemPickupRadiusMeters = 1.5;
   LobbyRules _lobbyRules = const LobbyRules.defaults();
@@ -369,9 +404,21 @@ class GameNetworkService {
   int? _localRecoilPlayerId;
   DateTime? _scheduledGameStartAt;
   DateTime? _gameStartedAt;
+  int _nextStateSequence = 0;
+  int? _lastAppliedStateSequence;
+  final Map<String, String> _lastBroadcastPlayerSignatureById =
+      <String, String>{};
+    final Map<String, String> _lastBroadcastItemSignatureById =
+      <String, String>{};
+    final Map<String, String> _lastBroadcastEffectSignatureById =
+      <String, String>{};
+      final Map<String, String> _lastBroadcastPickupSignatureById =
+        <String, String>{};
   Duration _serverClockOffset = Duration.zero;
   Set<String> _readyTeamLeadIds = <String>{};
   DateTime? _lastGpsBroadcast;
+  double? _lastBroadcastLatitude;
+  double? _lastBroadcastLongitude;
   DateTime? _lastItemSpawnAt;
 
   Stream<NetworkSnapshot> get updates => _updates.stream;
@@ -433,7 +480,7 @@ class GameNetworkService {
     }
 
     if (isServer) {
-      await _broadcastState();
+      _queueStateBroadcast(urgent: true);
     }
   }
 
@@ -448,14 +495,23 @@ class GameNetworkService {
       return false;
     }
 
+    final hitEventId = _newReliableId('hit');
     final hitPacket = NetworkPacket(
       type: PacketType.hit,
       playerId: shooterPlayerId,
       targetPlayerId: localPlayerId,
+      payload: <String, dynamic>{
+        'eventId': hitEventId,
+        'reliableId': hitEventId,
+        'reliableType': PacketType.hit.name,
+        'requiresAck': true,
+      },
     );
-    for (final peer in peerDirectory.peers) {
-      unawaited(transport.send(peer.host, peer.port, hitPacket));
-    }
+    _sendReliableToPeers(
+      packet: hitPacket,
+      reliableType: PacketType.hit.name,
+      reliableId: hitEventId,
+    );
 
     return true;
   }
@@ -524,6 +580,10 @@ class GameNetworkService {
       _serverItemTickTimer = Timer.periodic(
         _itemTickInterval,
         (_) => _tickServerOwnedItems(),
+      );
+      _stateBroadcastTickTimer = Timer.periodic(
+        _stateBroadcastTickInterval,
+        (_) => unawaited(_flushQueuedStateBroadcast()),
       );
     }
 
@@ -595,7 +655,7 @@ class GameNetworkService {
 
     if (isServer) {
       _checkForItemPickups();
-      await _broadcastState();
+      _queueStateBroadcast(urgent: true);
     }
   }
 
@@ -608,11 +668,28 @@ class GameNetworkService {
     _emit();
 
     final now = DateTime.now();
-    final last = _lastGpsBroadcast;
-    if (last != null && now.difference(last) < const Duration(seconds: 3)) {
+    final lastAt = _lastGpsBroadcast;
+    final shouldSendDueToTime =
+        lastAt == null || now.difference(lastAt) >= _gpsBroadcastMinInterval;
+
+    var movedEnough = true;
+    if (_lastBroadcastLatitude != null && _lastBroadcastLongitude != null) {
+      movedEnough =
+          _distanceMetersBetweenLatLng(
+            _lastBroadcastLatitude!,
+            _lastBroadcastLongitude!,
+            latitude,
+            longitude,
+          ) >=
+          _gpsBroadcastMinDistanceMeters;
+    }
+
+    if (!shouldSendDueToTime && !movedEnough) {
       return;
     }
     _lastGpsBroadcast = now;
+    _lastBroadcastLatitude = latitude;
+    _lastBroadcastLongitude = longitude;
 
     final packet = NetworkPacket(
       type: PacketType.heartbeat,
@@ -636,7 +713,7 @@ class GameNetworkService {
 
     if (isServer) {
       _checkForItemPickups();
-      await _broadcastState();
+      _queueStateBroadcast();
     }
   }
 
@@ -647,7 +724,7 @@ class GameNetworkService {
 
     _lobbyRules = rules;
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> setLobbyOpen(bool open) async {
@@ -660,7 +737,7 @@ class GameNetworkService {
 
     _lobbyOpen = open;
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> startGame() async {
@@ -700,11 +777,11 @@ class GameNetworkService {
       }
 
       _emit();
-      unawaited(_broadcastState());
+      _queueStateBroadcast();
     });
 
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> confirmTeamLeadReadyStart() async {
@@ -715,6 +792,7 @@ class GameNetworkService {
       return;
     }
 
+    final readyEventId = _newReliableId('ready');
     final packet = NetworkPacket(
       type: PacketType.ready,
       playerId: localPlayerId,
@@ -724,12 +802,16 @@ class GameNetworkService {
         'playerClass': localPlayer.playerClass,
         'gunConnected': localPlayer.gunConnected,
         'isHost': localPlayer.isHost,
+        'reliableId': readyEventId,
+        'reliableType': PacketType.ready.name,
+        'requiresAck': true,
       },
     );
-
-    for (final peer in peerDirectory.peers) {
-      await transport.send(peer.host, peer.port, packet);
-    }
+    _sendReliableToPeers(
+      packet: packet,
+      reliableType: PacketType.ready.name,
+      reliableId: readyEventId,
+    );
 
     if (isServer) {
       await _handleTeamLeadReady(localPlayerId);
@@ -766,7 +848,7 @@ class GameNetworkService {
     });
 
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> endGame() async {
@@ -794,11 +876,11 @@ class GameNetworkService {
 
     _gamePhase = GamePhase.ended;
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> sendShot(String targetPlayerId) async {
-    if (_gamePhase != GamePhase.running) {
+    if (_gamePhase == GamePhase.ended) {
       return;
     }
 
@@ -808,16 +890,28 @@ class GameNetworkService {
     );
     _emit();
 
+    final shotId = _newReliableId('shot');
     final packet = NetworkPacket(
       type: PacketType.shot,
       playerId: localPlayerId,
       targetPlayerId: targetPlayerId,
       playerName: localPlayer.name,
-      payload: <String, dynamic>{},
+      payload: <String, dynamic>{
+        'shotId': shotId,
+        'reliableId': shotId,
+        'reliableType': PacketType.shot.name,
+        'requiresAck': true,
+      },
     );
 
     for (final peer in peerDirectory.peers) {
-      unawaited(transport.send(peer.host, peer.port, packet));
+      _sendReliableToPeer(
+        host: peer.host,
+        port: peer.port,
+        packet: packet,
+        reliableType: PacketType.shot.name,
+        reliableId: shotId,
+      );
     }
   }
 
@@ -870,8 +964,21 @@ class GameNetworkService {
     final packet = envelope.packet;
     peerDirectory.add(PeerEndpoint(host: envelope.host, port: envelope.port));
 
+    if (isServer) {
+      _dedupePlayerByEndpoint(packet, envelope.host, envelope.port);
+    }
+
     switch (packet.type) {
+      case PacketType.ack:
+        _handleAck(packet, envelope.host, envelope.port);
+        break;
       case PacketType.hello:
+        if (packet.payload['browserProbe'] == true) {
+          if (isServer) {
+            _queueStateBroadcast();
+          }
+          break;
+        }
         _upsertPlayer(packet);
         transport.send(
           envelope.host,
@@ -879,19 +986,45 @@ class GameNetworkService {
           _buildProfilePacket(PacketType.join),
         );
         if (isServer) {
-          _broadcastState();
+          _queueStateBroadcast(urgent: true);
         }
         break;
       case PacketType.join:
         _upsertPlayer(packet);
         if (isServer) {
-          _broadcastState();
+          _queueStateBroadcast(urgent: true);
         }
         break;
       case PacketType.shot:
         _upsertPlayer(packet);
+        _acknowledgeIfRequired(packet, envelope.host, envelope.port);
+        if (_isDuplicateShotEvent(packet)) {
+          break;
+        }
+        if (isServer &&
+            packet.targetPlayerId != null &&
+            packet.targetPlayerId != localPlayerId) {
+          final targetId = packet.targetPlayerId!;
+          if (targetId != packet.playerId) {
+            _sendToPlayerEndpoint(targetId, packet);
+          }
+        }
+        if (isServer) {
+          final shooter = _players[packet.playerId];
+          if (shooter != null) {
+            _players[packet.playerId] = shooter.copyWith(
+              shotsFired: shooter.shotsFired + 1,
+              lastSeen: DateTime.now(),
+            );
+          }
+        }
         if (packet.targetPlayerId == localPlayerId &&
             _canRegisterDamageFrom(packet.playerId, localPlayerId)) {
+          final maxLives = _lobbyRules.maxLives;
+          if (maxLives > 0 && localPlayer.hitsTaken >= maxLives) {
+            // Already dead locally; ignore late/duplicate shots until respawn.
+            break;
+          }
           final nextHitsTaken = localPlayer.hitsTaken + 1;
           final isElimination =
               _lobbyRules.maxLives > 0 && nextHitsTaken >= _lobbyRules.maxLives;
@@ -900,15 +1033,25 @@ class GameNetworkService {
             hitsTaken: nextHitsTaken,
             lastSeen: DateTime.now(),
           );
-          transport.send(
-            envelope.host,
-            envelope.port,
-            NetworkPacket(
-              type: PacketType.hit,
-              playerId: packet.playerId,
-              targetPlayerId: localPlayerId,
-              payload: <String, dynamic>{'eliminated': isElimination},
-            ),
+          final hitEventId = _newReliableId('hit');
+          final hitPacket = NetworkPacket(
+            type: PacketType.hit,
+            playerId: packet.playerId,
+            targetPlayerId: localPlayerId,
+            payload: <String, dynamic>{
+              'eliminated': isElimination,
+              'eventId': hitEventId,
+              'reliableId': hitEventId,
+              'reliableType': PacketType.hit.name,
+              'requiresAck': true,
+            },
+          );
+          _sendReliableToPeer(
+            host: envelope.host,
+            port: envelope.port,
+            packet: hitPacket,
+            reliableType: PacketType.hit.name,
+            reliableId: hitEventId,
           );
           // Notify victim only when this hit actually eliminated them.
           if (isElimination && !_killEvents.isClosed) {
@@ -927,12 +1070,21 @@ class GameNetworkService {
         }
         break;
       case PacketType.hit:
+        _acknowledgeIfRequired(packet, envelope.host, envelope.port);
+        if (_isDuplicateHitEvent(packet)) {
+          break;
+        }
         if (isServer && packet.targetPlayerId != null) {
           final targetPlayerId = packet.targetPlayerId!;
           if (_gamePhase == GamePhase.running &&
               _canRegisterDamageFrom(packet.playerId, targetPlayerId)) {
             final target = _players[targetPlayerId];
             if (target != null) {
+              final maxLives = _lobbyRules.maxLives;
+              if (maxLives > 0 && target.hitsTaken >= maxLives) {
+                // Target is already dead and awaiting respawn; don't score again.
+                break;
+              }
               final nextHitsTaken = target.hitsTaken + 1;
               final isElimination =
                   _lobbyRules.maxLives > 0 &&
@@ -956,7 +1108,7 @@ class GameNetworkService {
                 _scheduleRespawnIfNeeded(targetPlayerId);
               }
               _emit();
-              unawaited(_broadcastState());
+              _queueStateBroadcast(urgent: true);
             }
           }
         }
@@ -984,12 +1136,12 @@ class GameNetworkService {
       case PacketType.heartbeat:
         _upsertPlayer(packet);
         if (isServer) {
-          // UDP packets can be dropped; rebroadcasting on heartbeat keeps
-          // all clients eventually consistent with player joins/updates.
-          unawaited(_broadcastState());
+          // Keep eventual consistency without forcing a full state on every heartbeat.
+          _queueStateBroadcast();
         }
         break;
       case PacketType.state:
+        _acknowledgeIfRequired(packet, envelope.host, envelope.port);
         _applyStatePacket(packet);
         break;
       case PacketType.voice:
@@ -1035,6 +1187,7 @@ class GameNetworkService {
         }
         break;
       case PacketType.ready:
+        _acknowledgeIfRequired(packet, envelope.host, envelope.port);
         _upsertPlayer(packet);
         if (isServer) {
           unawaited(_handleTeamLeadReady(packet.playerId));
@@ -1091,7 +1244,196 @@ class GameNetworkService {
     }
 
     _emit();
-    await _broadcastState();
+    _queueStateBroadcast(urgent: true);
+  }
+
+  void _queueStateBroadcast({bool urgent = false}) {
+    if (!isServer) {
+      return;
+    }
+    _stateBroadcastDirty = true;
+    if (urgent) {
+      _stateBroadcastUrgentPending = true;
+    }
+    if (urgent) {
+      unawaited(_flushQueuedStateBroadcast());
+    }
+  }
+
+  void _sendToPlayerEndpoint(String playerId, NetworkPacket packet) {
+    final endpointKey = _endpointKeyByPlayerId[playerId];
+    if (endpointKey == null) {
+      return;
+    }
+
+    final separator = endpointKey.lastIndexOf(':');
+    if (separator <= 0 || separator >= endpointKey.length - 1) {
+      return;
+    }
+
+    final host = endpointKey.substring(0, separator);
+    final port = int.tryParse(endpointKey.substring(separator + 1));
+    if (port == null) {
+      return;
+    }
+
+    unawaited(_safeSend(host: host, port: port, packet: packet));
+  }
+
+  Future<void> _flushQueuedStateBroadcast() async {
+    if (!isServer || !_stateBroadcastDirty || _stateBroadcastInFlight) {
+      return;
+    }
+
+    _stateBroadcastDirty = false;
+    final urgent = _stateBroadcastUrgentPending;
+    _stateBroadcastUrgentPending = false;
+    _stateBroadcastInFlight = true;
+    try {
+      await _broadcastState(reliableCritical: urgent);
+    } finally {
+      _stateBroadcastInFlight = false;
+      if (_stateBroadcastDirty) {
+        unawaited(_flushQueuedStateBroadcast());
+      }
+    }
+  }
+
+  String _newReliableId(String label) {
+    return '${label}_${localPlayerId}_${DateTime.now().microsecondsSinceEpoch}_${_random.nextInt(1 << 20)}';
+  }
+
+  void _sendReliableToPeers({
+    required NetworkPacket packet,
+    required String reliableType,
+    required String reliableId,
+  }) {
+    for (final peer in peerDirectory.peers) {
+      _sendReliableToPeer(
+        host: peer.host,
+        port: peer.port,
+        packet: packet,
+        reliableType: reliableType,
+        reliableId: reliableId,
+      );
+    }
+  }
+
+  void _sendReliableToPeer({
+    required String host,
+    required int port,
+    required NetworkPacket packet,
+    required String reliableType,
+    required String reliableId,
+  }) {
+    final key = '$host:$port:$reliableType:$reliableId';
+    final existing = _pendingReliableSendsByKey[key];
+    existing?.retryTimer?.cancel();
+
+    final pending = _PendingReliableSend(
+      host: host,
+      port: port,
+      packet: packet,
+      key: key,
+    );
+    _pendingReliableSendsByKey[key] = pending;
+
+    void sendAttempt() {
+      if (!_pendingReliableSendsByKey.containsKey(key)) {
+        return;
+      }
+      pending.attempts += 1;
+      unawaited(_safeSend(host: host, port: port, packet: packet));
+      if (pending.attempts >= _reliableMaxAttempts) {
+        pending.retryTimer?.cancel();
+        _pendingReliableSendsByKey.remove(key);
+      }
+    }
+
+    sendAttempt();
+    if (_pendingReliableSendsByKey.containsKey(key)) {
+      pending.retryTimer = Timer.periodic(_reliableRetryInterval, (_) {
+        sendAttempt();
+      });
+    }
+  }
+
+  Future<void> _safeSend({
+    required String host,
+    required int port,
+    required NetworkPacket packet,
+  }) async {
+    try {
+      await transport.send(host, port, packet);
+    } catch (_) {
+      // Ignore transient transport failures for retry-managed packets.
+    }
+  }
+
+  void _acknowledgeIfRequired(NetworkPacket packet, String host, int port) {
+    final requiresAck = packet.payload['requiresAck'] == true;
+    final reliableId = packet.payload['reliableId'] as String?;
+    final reliableType = packet.payload['reliableType'] as String?;
+    if (!requiresAck || reliableId == null || reliableType == null) {
+      return;
+    }
+
+    final ack = NetworkPacket(
+      type: PacketType.ack,
+      playerId: localPlayerId,
+      playerName: _players[localPlayerId]?.name,
+      payload: <String, dynamic>{
+        'ackId': reliableId,
+        'ackType': reliableType,
+      },
+    );
+    unawaited(_safeSend(host: host, port: port, packet: ack));
+  }
+
+  void _handleAck(NetworkPacket packet, String host, int port) {
+    final ackId = packet.payload['ackId'] as String?;
+    final ackType = packet.payload['ackType'] as String?;
+    if (ackId == null || ackType == null) {
+      return;
+    }
+
+    final key = '$host:$port:$ackType:$ackId';
+    final pending = _pendingReliableSendsByKey.remove(key);
+    pending?.retryTimer?.cancel();
+  }
+
+  bool _isDuplicateHitEvent(NetworkPacket packet) {
+    final eventId = packet.payload['eventId'] as String?;
+    if (eventId == null || eventId.isEmpty) {
+      return false;
+    }
+
+    final now = DateTime.now();
+    _processedHitEventIds.removeWhere(
+      (_, seenAt) => now.difference(seenAt) > _hitEventDedupTtl,
+    );
+    if (_processedHitEventIds.containsKey(eventId)) {
+      return true;
+    }
+    _processedHitEventIds[eventId] = now;
+    return false;
+  }
+
+  bool _isDuplicateShotEvent(NetworkPacket packet) {
+    final shotId = packet.payload['shotId'] as String?;
+    if (shotId == null || shotId.isEmpty) {
+      return false;
+    }
+
+    final now = DateTime.now();
+    _processedShotEventIds.removeWhere(
+      (_, seenAt) => now.difference(seenAt) > _shotEventDedupTtl,
+    );
+    if (_processedShotEventIds.containsKey(shotId)) {
+      return true;
+    }
+    _processedShotEventIds[shotId] = now;
+    return false;
   }
 
   void _upsertPlayer(NetworkPacket packet) {
@@ -1188,6 +1530,66 @@ class GameNetworkService {
     }
   }
 
+  void _dedupePlayerByEndpoint(NetworkPacket packet, String host, int port) {
+    final incomingId = packet.playerId;
+    if (incomingId == localPlayerId) {
+      return;
+    }
+
+    final incomingIsHost = packet.payload['isHost'] as bool? ?? false;
+    if (incomingIsHost) {
+      return;
+    }
+
+    final incomingName = (packet.playerName ?? '').trim().toLowerCase();
+    final endpointKey = '$host:$port';
+
+    String? duplicatePlayerId;
+    for (final entry in _endpointKeyByPlayerId.entries) {
+      final knownPlayerId = entry.key;
+      if (knownPlayerId == incomingId || entry.value != endpointKey) {
+        continue;
+      }
+
+      final knownPlayer = _players[knownPlayerId];
+      if (knownPlayer == null || knownPlayer.isHost) {
+        continue;
+      }
+
+      final knownName = knownPlayer.name.trim().toLowerCase();
+      if (incomingName.isNotEmpty && knownName == incomingName) {
+        duplicatePlayerId = knownPlayerId;
+        break;
+      }
+    }
+
+    if (duplicatePlayerId == null) {
+      _endpointKeyByPlayerId[incomingId] = endpointKey;
+      return;
+    }
+
+    final duplicate = _players[duplicatePlayerId];
+    if (duplicate != null) {
+      _preservedStatsByPlayerId[incomingId] = _PreservedPlayerStats(
+        score: duplicate.score,
+        kills: duplicate.kills,
+        deaths: duplicate.deaths,
+        hitsLanded: duplicate.hitsLanded,
+        shotsFired: duplicate.shotsFired,
+        hitsTaken: duplicate.hitsTaken,
+      );
+    }
+
+    _disconnectionGracePeriodTimers.remove(duplicatePlayerId)?.cancel();
+    _respawnTimers.remove(duplicatePlayerId)?.cancel();
+    _players.remove(duplicatePlayerId);
+    _recoilIdByPlayerId.remove(duplicatePlayerId);
+    _readyTeamLeadIds.remove(duplicatePlayerId);
+    _staleConnectionChecksByPlayerId.remove(duplicatePlayerId);
+    _endpointKeyByPlayerId.remove(duplicatePlayerId);
+    _endpointKeyByPlayerId[incomingId] = endpointKey;
+  }
+
   void _assignRoundRoles() {
     if (_lobbyRules.gameType == GameType.freeForAll) {
       for (final player in _players.values) {
@@ -1225,12 +1627,118 @@ class GameNetworkService {
     _trimReadyTeamLeads();
   }
 
-  Future<void> _broadcastState() async {
+  Future<void> _broadcastState({bool reliableCritical = false}) async {
+    final reliableId = reliableCritical ? _newReliableId('state') : null;
+    final stateSequence = ++_nextStateSequence;
+    final syncPlayers = _players.values;
+    final fullWorldSync =
+      reliableCritical || _lastBroadcastItemSignatureById.isEmpty;
+    final fullEffectSync =
+      reliableCritical || _lastBroadcastEffectSignatureById.isEmpty;
+    final fullPickupSync =
+        reliableCritical || _lastBroadcastPickupSignatureById.isEmpty;
+
+    final currentSignatures = <String, String>{};
+    final fullPlayerSync =
+        reliableCritical || _lastBroadcastPlayerSignatureById.isEmpty;
+    final fullPlayers = <Map<String, dynamic>>[];
+    final playerDeltas = <Map<String, dynamic>>[];
+
+    for (final player in syncPlayers) {
+      final signature = _playerSyncSignature(player);
+      currentSignatures[player.id] = signature;
+      if (fullPlayerSync ||
+          _lastBroadcastPlayerSignatureById[player.id] != signature) {
+        final serialized = _serializePlayer(player);
+        if (fullPlayerSync) {
+          fullPlayers.add(serialized);
+        } else {
+          playerDeltas.add(serialized);
+        }
+      }
+    }
+
+    final removedPlayerIds = _lastBroadcastPlayerSignatureById.keys
+        .where((id) => !currentSignatures.containsKey(id))
+        .toList();
+    _lastBroadcastPlayerSignatureById
+      ..clear()
+      ..addAll(currentSignatures);
+
+    final currentItemSignatures = <String, String>{};
+    final fullItems = <Map<String, dynamic>>[];
+    final itemDeltas = <Map<String, dynamic>>[];
+    for (final item in _items) {
+      final signature = _itemSyncSignature(item);
+      currentItemSignatures[item.id] = signature;
+      if (fullWorldSync || _lastBroadcastItemSignatureById[item.id] != signature) {
+        final serialized = item.toJson();
+        if (fullWorldSync) {
+          fullItems.add(serialized);
+        } else {
+          itemDeltas.add(serialized);
+        }
+      }
+    }
+    final removedItemIds = _lastBroadcastItemSignatureById.keys
+        .where((id) => !currentItemSignatures.containsKey(id))
+        .toList();
+    _lastBroadcastItemSignatureById
+      ..clear()
+      ..addAll(currentItemSignatures);
+
+    final currentEffectSignatures = <String, String>{};
+    final fullEffects = <Map<String, dynamic>>[];
+    final effectDeltas = <Map<String, dynamic>>[];
+    for (final effect in _activeEffects) {
+      final signature = _effectSyncSignature(effect);
+      currentEffectSignatures[effect.id] = signature;
+      if (fullEffectSync ||
+          _lastBroadcastEffectSignatureById[effect.id] != signature) {
+        final serialized = effect.toJson();
+        if (fullEffectSync) {
+          fullEffects.add(serialized);
+        } else {
+          effectDeltas.add(serialized);
+        }
+      }
+    }
+    final removedEffectIds = _lastBroadcastEffectSignatureById.keys
+        .where((id) => !currentEffectSignatures.containsKey(id))
+        .toList();
+    _lastBroadcastEffectSignatureById
+      ..clear()
+      ..addAll(currentEffectSignatures);
+
+    final currentPickupSignatures = <String, String>{};
+    final fullPickups = <Map<String, dynamic>>[];
+    final pickupDeltas = <Map<String, dynamic>>[];
+    for (final pickup in _recentItemPickups) {
+      final signature = _pickupSyncSignature(pickup);
+      currentPickupSignatures[pickup.id] = signature;
+      if (fullPickupSync ||
+          _lastBroadcastPickupSignatureById[pickup.id] != signature) {
+        final serialized = pickup.toJson();
+        if (fullPickupSync) {
+          fullPickups.add(serialized);
+        } else {
+          pickupDeltas.add(serialized);
+        }
+      }
+    }
+    final removedPickupIds = _lastBroadcastPickupSignatureById.keys
+        .where((id) => !currentPickupSignatures.containsKey(id))
+        .toList();
+    _lastBroadcastPickupSignatureById
+      ..clear()
+      ..addAll(currentPickupSignatures);
+
     final packet = NetworkPacket(
       type: PacketType.state,
       playerId: localPlayerId,
       playerName: localPlayer.name,
       payload: <String, dynamic>{
+        'stateSequence': stateSequence,
         'lobbyOpen': _lobbyOpen,
         'serverPlayerId': _serverPlayerId,
         'serverNow': DateTime.now().toUtc().toIso8601String(),
@@ -1241,23 +1749,70 @@ class GameNetworkService {
         'gameStartedAt': _gameStartedAt?.toUtc().toIso8601String(),
         'readyTeamLeadIds': _readyTeamLeadIds.toList(),
         'rules': _lobbyRules.toJson(),
-        'items': _items.map((item) => item.toJson()).toList(),
-        'activeEffects': _activeEffects
-            .map((effect) => effect.toJson())
-            .toList(),
-        'recentItemPickups': _recentItemPickups
-            .map((pickup) => pickup.toJson())
-            .toList(),
-        'players': _players.values
-            .where((p) => p.id != localPlayerId)
-            .map(_serializePlayer)
-            .toList(),
+        if (fullWorldSync) 'items': fullItems,
+        if (!fullWorldSync) 'itemDeltas': itemDeltas,
+        if (!fullWorldSync) 'removedItemIds': removedItemIds,
+        if (fullEffectSync) 'activeEffects': fullEffects,
+        if (!fullEffectSync) 'activeEffectDeltas': effectDeltas,
+        if (!fullEffectSync) 'removedActiveEffectIds': removedEffectIds,
+        if (fullPickupSync) 'recentItemPickups': fullPickups,
+        if (!fullPickupSync) 'pickupDeltas': pickupDeltas,
+        if (!fullPickupSync) 'removedPickupIds': removedPickupIds,
+        if (fullPlayerSync) 'players': fullPlayers,
+        if (!fullPlayerSync) 'playerDeltas': playerDeltas,
+        if (!fullPlayerSync) 'removedPlayerIds': removedPlayerIds,
+        'reliableId': reliableId,
+        'reliableType': reliableId == null ? null : PacketType.state.name,
+        'requiresAck': reliableId == null ? null : true,
       },
     );
+
+    if (reliableId != null) {
+      _sendReliableToPeers(
+        packet: packet,
+        reliableType: PacketType.state.name,
+        reliableId: reliableId,
+      );
+      return;
+    }
 
     for (final peer in peerDirectory.peers) {
       await transport.send(peer.host, peer.port, packet);
     }
+  }
+
+  String _playerSyncSignature(PlayerState player) {
+    return jsonEncode(<String, dynamic>{
+      'id': player.id,
+      'name': player.name,
+      'group': player.group,
+      'playerClass': player.playerClass,
+      'score': player.score,
+      'kills': player.kills,
+      'deaths': player.deaths,
+      'hitsLanded': player.hitsLanded,
+      'shotsFired': player.shotsFired,
+      'hitsTaken': player.hitsTaken,
+      'gunConnected': player.gunConnected,
+      'isHost': player.isHost,
+      'lastSeen': player.lastSeen.toIso8601String(),
+      'latitude': player.latitude,
+      'longitude': player.longitude,
+      'isNetworkConnected': player.isNetworkConnected,
+      'recoilPlayerId': _recoilIdByPlayerId[player.id],
+    });
+  }
+
+  String _itemSyncSignature(GameMapItem item) {
+    return jsonEncode(item.toJson());
+  }
+
+  String _effectSyncSignature(ActiveGameEffect effect) {
+    return jsonEncode(effect.toJson());
+  }
+
+  String _pickupSyncSignature(GameItemPickupNotification pickup) {
+    return jsonEncode(pickup.toJson());
   }
 
   void _relayPacketExcept({
@@ -1303,7 +1858,7 @@ class GameNetworkService {
         pickupCountBefore != _recentItemPickups.length;
     if (stateChanged) {
       _emit();
-      unawaited(_broadcastState());
+      _queueStateBroadcast();
     }
 
     if (_gamePhase != GamePhase.running) {
@@ -1354,7 +1909,7 @@ class GameNetworkService {
         longitude: spawned.$2,
       ),
     );
-    unawaited(_broadcastState());
+    _queueStateBroadcast();
     return true;
   }
 
@@ -1413,7 +1968,7 @@ class GameNetworkService {
       ..clear()
       ..addAll(remainingItems);
     _emit();
-    unawaited(_broadcastState());
+    _queueStateBroadcast();
   }
 
   void _applyItemEffectToGame(GameMapItem item, PlayerState collector) {
@@ -1564,6 +2119,16 @@ class GameNetworkService {
   }
 
   void _applyStatePacket(NetworkPacket packet) {
+    final incomingStateSequence = (packet.payload['stateSequence'] as num?)
+        ?.toInt();
+    if (incomingStateSequence != null) {
+      final lastApplied = _lastAppliedStateSequence;
+      if (lastApplied != null && incomingStateSequence <= lastApplied) {
+        return;
+      }
+      _lastAppliedStateSequence = incomingStateSequence;
+    }
+
     final receivedAtUtc = DateTime.now().toUtc();
     final serverNowUtc = DateTime.tryParse(
       packet.payload['serverNow'] as String? ?? '',
@@ -1599,91 +2164,225 @@ class GameNetworkService {
       _lobbyRules = LobbyRules.fromJson(rules);
     }
 
-    final rawItems =
-        packet.payload['items'] as List<dynamic>? ?? const <dynamic>[];
-    _items
-      ..clear()
-      ..addAll(
-        rawItems.whereType<Map>().map(
-          (rawItem) => GameMapItem.fromJson(rawItem.cast<String, dynamic>()),
-        ),
-      );
-
-    final rawEffects =
-        packet.payload['activeEffects'] as List<dynamic>? ?? const <dynamic>[];
-    _activeEffects
-      ..clear()
-      ..addAll(
-        rawEffects.whereType<Map>().map(
-          (rawEffect) =>
-              ActiveGameEffect.fromJson(rawEffect.cast<String, dynamic>()),
-        ),
-      );
-
-    final rawPickups =
-        packet.payload['recentItemPickups'] as List<dynamic>? ??
-        const <dynamic>[];
-    _recentItemPickups
-      ..clear()
-      ..addAll(
-        rawPickups.whereType<Map>().map(
-          (rawPickup) => GameItemPickupNotification.fromJson(
-            rawPickup.cast<String, dynamic>(),
+    final hasFullItems = packet.payload.containsKey('items');
+    if (hasFullItems) {
+      final rawItems =
+          packet.payload['items'] as List<dynamic>? ?? const <dynamic>[];
+      _items
+        ..clear()
+        ..addAll(
+          rawItems.whereType<Map>().map(
+            (rawItem) => GameMapItem.fromJson(rawItem.cast<String, dynamic>()),
           ),
-        ),
-      );
-
-    final rawPlayers =
-        packet.payload['players'] as List<dynamic>? ?? const <dynamic>[];
-    final nextPlayers = <String, PlayerState>{};
-    final nextRecoilIdByPlayerId = <String, int>{};
-    for (final rawPlayer in rawPlayers) {
-      final player = (rawPlayer as Map).cast<String, dynamic>();
-      final id = player['id'] as String? ?? 'unknown';
-      final recoilPlayerId = (player['recoilPlayerId'] as num?)?.toInt();
-      if (recoilPlayerId != null && recoilPlayerId > 0) {
-        nextRecoilIdByPlayerId[id] = recoilPlayerId;
+        );
+    } else {
+      final deltaRawItems =
+          packet.payload['itemDeltas'] as List<dynamic>? ?? const <dynamic>[];
+      if (deltaRawItems.isNotEmpty) {
+        final nextById = <String, GameMapItem>{
+          for (final item in _items) item.id: item,
+        };
+        for (final rawItem in deltaRawItems.whereType<Map>()) {
+          final parsed = GameMapItem.fromJson(rawItem.cast<String, dynamic>());
+          nextById[parsed.id] = parsed;
+        }
+        _items
+          ..clear()
+          ..addAll(nextById.values);
       }
-      nextPlayers[id] = PlayerState(
-        id: id,
-        name: player['name'] as String? ?? id,
-        group: player['group'] as String? ?? 'A',
-        playerClass: player['playerClass'] as String? ?? 'Assult',
-        score: player['score'] as int? ?? 0,
-        kills: player['kills'] as int? ?? 0,
-        deaths: player['deaths'] as int? ?? 0,
-        hitsLanded: player['hitsLanded'] as int? ?? 0,
-        shotsFired: player['shotsFired'] as int? ?? 0,
-        hitsTaken: player['hitsTaken'] as int? ?? 0,
-        gunConnected: player['gunConnected'] as bool? ?? false,
-        isHost: player['isHost'] as bool? ?? false,
-        lastSeen:
-            DateTime.tryParse(player['lastSeen'] as String? ?? '') ??
-            DateTime.now(),
-        latitude: (player['latitude'] as num?)?.toDouble(),
-        longitude: (player['longitude'] as num?)?.toDouble(),
-        isNetworkConnected: player['isNetworkConnected'] as bool? ?? true,
-      );
+
+      final removedItemIds =
+          (packet.payload['removedItemIds'] as List<dynamic>? ??
+                  const <dynamic>[])
+              .whereType<String>()
+              .toSet();
+      if (removedItemIds.isNotEmpty) {
+        _items.removeWhere((item) => removedItemIds.contains(item.id));
+      }
+    }
+
+    final hasFullEffects = packet.payload.containsKey('activeEffects');
+    if (hasFullEffects) {
+      final rawEffects =
+          packet.payload['activeEffects'] as List<dynamic>? ??
+          const <dynamic>[];
+      _activeEffects
+        ..clear()
+        ..addAll(
+          rawEffects.whereType<Map>().map(
+            (rawEffect) =>
+                ActiveGameEffect.fromJson(rawEffect.cast<String, dynamic>()),
+          ),
+        );
+    } else {
+      final deltaRawEffects =
+          packet.payload['activeEffectDeltas'] as List<dynamic>? ??
+          const <dynamic>[];
+      if (deltaRawEffects.isNotEmpty) {
+        final nextById = <String, ActiveGameEffect>{
+          for (final effect in _activeEffects) effect.id: effect,
+        };
+        for (final rawEffect in deltaRawEffects.whereType<Map>()) {
+          final parsed = ActiveGameEffect.fromJson(
+            rawEffect.cast<String, dynamic>(),
+          );
+          nextById[parsed.id] = parsed;
+        }
+        _activeEffects
+          ..clear()
+          ..addAll(nextById.values);
+      }
+
+      final removedEffectIds =
+          (packet.payload['removedActiveEffectIds'] as List<dynamic>? ??
+                  const <dynamic>[])
+              .whereType<String>()
+              .toSet();
+      if (removedEffectIds.isNotEmpty) {
+        _activeEffects.removeWhere((effect) => removedEffectIds.contains(effect.id));
+      }
+    }
+
+    final hasFullPickups = packet.payload.containsKey('recentItemPickups');
+    if (hasFullPickups) {
+      final rawPickups =
+          packet.payload['recentItemPickups'] as List<dynamic>? ??
+          const <dynamic>[];
+      _recentItemPickups
+        ..clear()
+        ..addAll(
+          rawPickups.whereType<Map>().map(
+            (rawPickup) => GameItemPickupNotification.fromJson(
+              rawPickup.cast<String, dynamic>(),
+            ),
+          ),
+        );
+    } else {
+      final deltaRawPickups =
+          packet.payload['pickupDeltas'] as List<dynamic>? ?? const <dynamic>[];
+      if (deltaRawPickups.isNotEmpty) {
+        final nextById = <String, GameItemPickupNotification>{
+          for (final pickup in _recentItemPickups) pickup.id: pickup,
+        };
+        for (final rawPickup in deltaRawPickups.whereType<Map>()) {
+          final parsed = GameItemPickupNotification.fromJson(
+            rawPickup.cast<String, dynamic>(),
+          );
+          nextById[parsed.id] = parsed;
+        }
+        _recentItemPickups
+          ..clear()
+          ..addAll(nextById.values);
+      }
+
+      final removedPickupIds =
+          (packet.payload['removedPickupIds'] as List<dynamic>? ??
+                  const <dynamic>[])
+              .whereType<String>()
+              .toSet();
+      if (removedPickupIds.isNotEmpty) {
+        _recentItemPickups.removeWhere(
+          (pickup) => removedPickupIds.contains(pickup.id),
+        );
+      }
+    }
+
+    final selfState = _players[localPlayerId];
+    final selfRecoilPlayerId = _recoilIdByPlayerId[localPlayerId];
+
+    final hasFullPlayers = packet.payload.containsKey('players');
+    if (hasFullPlayers) {
+      final rawPlayers =
+          packet.payload['players'] as List<dynamic>? ?? const <dynamic>[];
+      final nextPlayers = <String, PlayerState>{};
+      final nextRecoilIdByPlayerId = <String, int>{};
+      for (final rawPlayer in rawPlayers) {
+        final player = (rawPlayer as Map).cast<String, dynamic>();
+        final id = player['id'] as String? ?? 'unknown';
+        final recoilPlayerId = (player['recoilPlayerId'] as num?)?.toInt();
+        final isHost = player['isHost'] as bool? ?? false;
+        if (!isServer && isHost) {
+          continue;
+        }
+        if (recoilPlayerId != null && recoilPlayerId > 0) {
+          nextRecoilIdByPlayerId[id] = recoilPlayerId;
+        }
+        nextPlayers[id] = _deserializePlayer(player);
+      }
+
+      _players
+        ..clear()
+        ..addAll(nextPlayers);
+
+      _recoilIdByPlayerId
+        ..removeWhere((playerId, _) => playerId != localPlayerId)
+        ..addAll(nextRecoilIdByPlayerId);
+    } else {
+      final rawPlayerDeltas =
+          packet.payload['playerDeltas'] as List<dynamic>? ?? const <dynamic>[];
+      for (final rawPlayer in rawPlayerDeltas) {
+        final player = (rawPlayer as Map).cast<String, dynamic>();
+        final id = player['id'] as String?;
+        if (id == null || id.isEmpty) {
+          continue;
+        }
+        final isHost = player['isHost'] as bool? ?? false;
+        if (!isServer && isHost) {
+          continue;
+        }
+        _players[id] = _deserializePlayer(player);
+
+        final recoilPlayerId = (player['recoilPlayerId'] as num?)?.toInt();
+        if (recoilPlayerId != null && recoilPlayerId > 0) {
+          _recoilIdByPlayerId[id] = recoilPlayerId;
+        } else {
+          _recoilIdByPlayerId.remove(id);
+        }
+      }
+
+      final removedIds =
+          (packet.payload['removedPlayerIds'] as List<dynamic>? ??
+                  const <dynamic>[])
+              .whereType<String>();
+      for (final removedId in removedIds) {
+        _players.remove(removedId);
+        _recoilIdByPlayerId.remove(removedId);
+      }
     }
 
     // Preserve the local player's own entry in case the server broadcast
     // arrived before our hello was registered on the server side.
-    final selfState = _players[localPlayerId];
-    final selfRecoilPlayerId = _recoilIdByPlayerId[localPlayerId];
-    _players
-      ..clear()
-      ..addAll(nextPlayers);
     if (selfState != null && !_players.containsKey(localPlayerId)) {
       _players[localPlayerId] = selfState;
     }
-
-    _recoilIdByPlayerId
-      ..removeWhere((playerId, _) => playerId != localPlayerId)
-      ..addAll(nextRecoilIdByPlayerId);
     if (selfRecoilPlayerId != null &&
         !_recoilIdByPlayerId.containsKey(localPlayerId)) {
       _recoilIdByPlayerId[localPlayerId] = selfRecoilPlayerId;
     }
+  }
+
+  PlayerState _deserializePlayer(Map<String, dynamic> player) {
+    final id = player['id'] as String? ?? 'unknown';
+    return PlayerState(
+      id: id,
+      name: player['name'] as String? ?? id,
+      group: player['group'] as String? ?? 'A',
+      playerClass: player['playerClass'] as String? ?? 'Assult',
+      score: player['score'] as int? ?? 0,
+      kills: player['kills'] as int? ?? 0,
+      deaths: player['deaths'] as int? ?? 0,
+      hitsLanded: player['hitsLanded'] as int? ?? 0,
+      shotsFired: player['shotsFired'] as int? ?? 0,
+      hitsTaken: player['hitsTaken'] as int? ?? 0,
+      gunConnected: player['gunConnected'] as bool? ?? false,
+      isHost: player['isHost'] as bool? ?? false,
+      lastSeen:
+          DateTime.tryParse(player['lastSeen'] as String? ?? '') ??
+          DateTime.now(),
+      latitude: (player['latitude'] as num?)?.toDouble(),
+      longitude: (player['longitude'] as num?)?.toDouble(),
+      isNetworkConnected: player['isNetworkConnected'] as bool? ?? true,
+    );
   }
 
   void _emit() {
@@ -1722,7 +2421,7 @@ class GameNetworkService {
     }
 
     // Keep clients in sync even if an earlier UDP state packet was dropped.
-    unawaited(_broadcastState());
+    _queueStateBroadcast();
   }
 
   /// Starts the grace period for a disconnected player.
@@ -1746,7 +2445,7 @@ class GameNetworkService {
     );
 
     _emit();
-    unawaited(_broadcastState());
+    _queueStateBroadcast(urgent: true);
   }
 
   /// Ends the grace period for a disconnected player and removes them from the game.
@@ -1768,8 +2467,9 @@ class GameNetworkService {
     _players.remove(playerId);
     _recoilIdByPlayerId.remove(playerId);
     _readyTeamLeadIds.remove(playerId);
+    _endpointKeyByPlayerId.remove(playerId);
     _emit();
-    unawaited(_broadcastState());
+    _queueStateBroadcast(urgent: true);
   }
 
   void _scheduleRespawnIfNeeded(String playerId) {
@@ -1808,7 +2508,7 @@ class GameNetworkService {
         lastSeen: DateTime.now(),
       );
       _emit();
-      unawaited(_broadcastState());
+      _queueStateBroadcast(urgent: true);
     });
   }
 
@@ -1831,7 +2531,7 @@ class GameNetworkService {
     );
 
     _emit();
-    unawaited(_broadcastState());
+    _queueStateBroadcast(urgent: true);
   }
 
   Future<void> stop() async {
@@ -1841,6 +2541,19 @@ class GameNetworkService {
     _connectionCheckTimer?.cancel();
     _keepAliveTimer?.cancel();
     _serverItemTickTimer?.cancel();
+    _stateBroadcastTickTimer?.cancel();
+    _stateBroadcastDirty = false;
+    _stateBroadcastInFlight = false;
+    _stateBroadcastUrgentPending = false;
+    for (final pending in _pendingReliableSendsByKey.values) {
+      pending.retryTimer?.cancel();
+    }
+    _pendingReliableSendsByKey.clear();
+    _processedHitEventIds.clear();
+    _lastBroadcastPlayerSignatureById.clear();
+    _lastBroadcastItemSignatureById.clear();
+    _lastBroadcastEffectSignatureById.clear();
+    _lastBroadcastPickupSignatureById.clear();
     for (final timer in _respawnTimers.values) {
       timer.cancel();
     }
@@ -1850,6 +2563,7 @@ class GameNetworkService {
     }
     _disconnectionGracePeriodTimers.clear();
     _staleConnectionChecksByPlayerId.clear();
+    _endpointKeyByPlayerId.clear();
     await _sub?.cancel();
     await transport.stop();
     await _teamVoiceMessages.close();

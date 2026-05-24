@@ -119,7 +119,7 @@ class PlayerResultsScreen extends StatelessWidget {
                     color: Colors.black.withValues(alpha: 0.28),
                     child: ListView.separated(
                       itemCount: sortedPlayers.length,
-                      separatorBuilder: (_, __) =>
+                        separatorBuilder: (_, unusedIndex) =>
                           const Divider(height: 1, color: Colors.white24),
                       itemBuilder: (context, index) {
                         final player = sortedPlayers[index];

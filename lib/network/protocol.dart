@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-enum PacketType { hello, join, shot, hit, heartbeat, state, voice, ready }
+enum PacketType { hello, join, shot, hit, heartbeat, state, voice, ready, ack }
 
 PacketType _typeFromString(String value) {
   return PacketType.values.firstWhere(

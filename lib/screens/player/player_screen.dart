@@ -86,6 +86,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _showGunDisconnectedAlert = false;
   bool _showJoinCodeFallback = false;
   bool _hasJoinedLobby = false;
+  bool _isJoiningLobby = false;
   bool _isConnectingGun = false;
   bool _isRecordingVoice = false;
   bool _recoilEnabled = true;
@@ -324,6 +325,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _voicePlayer = AudioPlayer();
     _gunSfxPlayer = AudioPlayer();
 
+    final initialPlayerName = widget.initialPlayerName?.trim();
+    final resolvedInitialPlayerName =
+      (initialPlayerName != null && initialPlayerName.isNotEmpty)
+      ? initialPlayerName
+      : 'Player';
+
     // Use initial values from widget if provided
     if (widget.initialTeam != null && _teams.contains(widget.initialTeam)) {
       _selectedTeam = widget.initialTeam!;
@@ -332,7 +339,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _service = GameNetworkService(
       transport: UdpNetworkTransport(localPort: _playerPort),
       localPlayerId: deviceId('player'),
-      initialPlayerName: 'Player',
+      initialPlayerName: resolvedInitialPlayerName,
       initialPlayerGroup: _selectedTeam,
       peerDirectory: _peerDirectory,
     );
@@ -842,6 +849,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _bootstrap() async {
     await _service.start();
+    final loadedName = _nameController.text.trim();
+    if (loadedName.isNotEmpty && loadedName != _service.localPlayer.name) {
+      await _service.updateLocalProfile(name: loadedName);
+    }
     _teamVoiceSub = _service.teamVoiceMessages.listen(_onTeamVoiceReceived);
     _service.killEvents.listen((kill) {
       if (!mounted) return;
@@ -1125,6 +1136,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _joinLobby() async {
+    if (_isJoiningLobby || _hasJoinedLobby) {
+      return;
+    }
+
     final name = _nameController.text.trim();
     final joinCode = _joinCodeController.text.trim();
 
@@ -1147,17 +1162,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
+    setState(() {
+      _isJoiningLobby = true;
+    });
 
-    await _bootstrapFuture;
-
-    await _service.updateLocalProfile(
-      name: name,
-      group: _selectedTeam,
-      gunConnected: _gunConnected,
-    );
     try {
+      _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
+
+      await _bootstrapFuture;
+
+      await _service.updateLocalProfile(
+        name: name,
+        group: _selectedTeam,
+        gunConnected: _gunConnected,
+      );
       await _service.connect();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _hasJoinedLobby = true;
+        _status =
+            'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
+      });
     } catch (_) {
       if (!mounted) {
         return;
@@ -1166,23 +1195,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _status =
             'Could not connect to lobby. Check join code/network and try again.';
       });
-      return;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isJoiningLobby = false;
+        });
+      }
     }
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _hasJoinedLobby = true;
-      _status =
-          'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
-    });
   }
 
   Future<void> _autoJoinLobby() async {
     final joinCode = widget.joinCode;
     if (joinCode == null) {
+      return;
+    }
+
+    if (_isJoiningLobby || _hasJoinedLobby) {
       return;
     }
 
@@ -1206,17 +1234,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
+    setState(() {
+      _isJoiningLobby = true;
+    });
 
-    await _bootstrapFuture;
-
-    await _service.updateLocalProfile(
-      name: name,
-      group: _selectedTeam,
-      gunConnected: _gunConnected,
-    );
     try {
+      _peerDirectory.replaceAll(<PeerEndpoint>[serverEndpoint]);
+
+      await _bootstrapFuture;
+
+      await _service.updateLocalProfile(
+        name: name,
+        group: _selectedTeam,
+        gunConnected: _gunConnected,
+      );
       await _service.connect();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _hasJoinedLobby = true;
+        _status =
+            'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
+      });
     } catch (_) {
       if (!mounted) {
         return;
@@ -1225,18 +1267,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _status =
             'Could not connect to lobby. Check join code/network and try again.';
       });
-      return;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isJoiningLobby = false;
+        });
+      }
     }
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _hasJoinedLobby = true;
-      _status =
-          'Joined lobby at ${serverEndpoint.host}:${serverEndpoint.port}';
-    });
   }
 
   Future<void> _handleTeamSelectionChanged(

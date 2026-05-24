@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import 'gun_profile_storage.dart';
@@ -58,6 +59,8 @@ extension GunBatteryLevelLabel on GunBatteryLevel {
 class BleGunController {
   BleGunController._();
 
+  static void Function(String message)? diagnosticsLogger;
+
   static final Map<String, Future<void>> _configWriteLocks =
       <String, Future<void>>{};
   static final Map<String, Future<void>> _commandWriteLocks =
@@ -111,6 +114,26 @@ class BleGunController {
     return normalizedDeviceId;
   }
 
+  static void _log(String message) {
+    final formatted = '[BleGunController] $message';
+    final logger = diagnosticsLogger;
+    if (logger != null) {
+      logger(formatted);
+      return;
+    }
+    debugPrint(formatted);
+  }
+
+  static void clearCachedHandles({required String deviceId}) {
+    final key = _normalizeDeviceId(deviceId);
+    _log('clearCachedHandles device=$key');
+    _configCharacteristics.remove(key);
+    _telemetryCharacteristics.remove(key);
+    _commandCharacteristics.remove(key);
+    _configWriteLocks.remove(key);
+    _commandWriteLocks.remove(key);
+  }
+
   static BluetoothDevice deviceFromId(String deviceId) {
     return BluetoothDevice.fromId(_normalizeDeviceId(deviceId));
   }
@@ -131,9 +154,11 @@ class BleGunController {
     final key = _normalizeDeviceId(deviceId);
     final cached = _configCharacteristics[key];
     if (cached != null) {
+      _log('config characteristic cache hit device=$key');
       return cached;
     }
 
+    _log('config characteristic discover start device=$key');
     final device = await connect(deviceId: deviceId);
 
     final services = await device.discoverServices();
@@ -163,6 +188,7 @@ class BleGunController {
     }
 
     _configCharacteristics[key] = characteristic;
+    _log('config characteristic discover success device=$key');
     return characteristic;
   }
 
@@ -172,9 +198,11 @@ class BleGunController {
     final key = _normalizeDeviceId(deviceId);
     final cached = _telemetryCharacteristics[key];
     if (cached != null) {
+      _log('telemetry characteristic cache hit device=$key');
       return cached;
     }
 
+    _log('telemetry characteristic discover start device=$key');
     final device = await connect(deviceId: deviceId);
 
     final services = await device.discoverServices();
@@ -204,6 +232,7 @@ class BleGunController {
     }
 
     _telemetryCharacteristics[key] = characteristic;
+    _log('telemetry characteristic discover success device=$key');
     return characteristic;
   }
 
@@ -213,9 +242,11 @@ class BleGunController {
     final key = _normalizeDeviceId(deviceId);
     final cached = _commandCharacteristics[key];
     if (cached != null) {
+      _log('command characteristic cache hit device=$key');
       return cached;
     }
 
+    _log('command characteristic discover start device=$key');
     final device = await connect(deviceId: deviceId);
 
     final services = await device.discoverServices();
@@ -247,6 +278,7 @@ class BleGunController {
     }
 
     _commandCharacteristics[key] = characteristic;
+    _log('command characteristic discover success device=$key');
     return characteristic;
   }
 
@@ -350,10 +382,19 @@ class BleGunController {
   static Stream<GunTelemetrySample> watchTelemetry({
     required String deviceId,
   }) async* {
+    final key = _normalizeDeviceId(deviceId);
+    _log('watchTelemetry start device=$key');
     final characteristic = await _telemetryCharacteristicForDevice(deviceId);
-    if (!characteristic.isNotifying) {
-      await characteristic.setNotifyValue(true);
+    // Force a fresh notify subscription after reconnect to avoid stale streams.
+    try {
+      await characteristic.setNotifyValue(false);
+      _log('watchTelemetry notify false device=$key');
+    } catch (_) {
+      // Best effort only.
+      _log('watchTelemetry notify false failed device=$key');
     }
+    await characteristic.setNotifyValue(true);
+    _log('watchTelemetry notify true device=$key');
 
     yield* characteristic.lastValueStream
         .where((value) => value.length > _recoilTelemetryStatusOffset)
@@ -447,25 +488,30 @@ class BleGunController {
     required String deviceId,
     Duration timeout = const Duration(seconds: 6),
   }) async {
+    final key = _normalizeDeviceId(deviceId);
+    _log('connect start device=$key');
     final isBluetoothOn =
         await FlutterBluePlus.adapterState.first == BluetoothAdapterState.on;
     if (!isBluetoothOn) {
+      _log('connect failed bluetooth off device=$key');
       throw StateError('Bluetooth is off.');
     }
 
     final device = deviceFromId(deviceId);
-    final key = _normalizeDeviceId(deviceId);
     if (device.isDisconnected) {
-      _configCharacteristics.remove(key);
-      _telemetryCharacteristics.remove(key);
-      _commandCharacteristics.remove(key);
+      clearCachedHandles(deviceId: deviceId);
       try {
         await device.connect(timeout: timeout);
+        _log('connect success device=$key');
       } on Exception {
         if (device.isDisconnected) {
+          _log('connect failed device=$key');
           rethrow;
         }
+        _log('connect recovered (already connected) device=$key');
       }
+    } else {
+      _log('connect skipped already connected device=$key');
     }
 
     return device;
@@ -473,19 +519,18 @@ class BleGunController {
 
   static Future<void> disconnect({required String deviceId}) async {
     final key = _normalizeDeviceId(deviceId);
+    _log('disconnect start device=$key');
     final device = deviceFromId(deviceId);
 
-    _configCharacteristics.remove(key);
-    _telemetryCharacteristics.remove(key);
-    _commandCharacteristics.remove(key);
-    _configWriteLocks.remove(key);
-    _commandWriteLocks.remove(key);
+    clearCachedHandles(deviceId: deviceId);
 
     if (device.isDisconnected) {
+      _log('disconnect skipped already disconnected device=$key');
       return;
     }
 
     await device.disconnect();
+    _log('disconnect success device=$key');
   }
 
   static Future<void> setRecoilMode({

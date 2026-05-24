@@ -3,8 +3,13 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../theme/team_colors.dart';
 
+final Map<String, String> _runtimeDeviceIdsByPrefix = <String, String>{};
+
 String deviceId(String prefix) {
-  return '$prefix-${DateTime.now().microsecondsSinceEpoch}';
+  return _runtimeDeviceIdsByPrefix.putIfAbsent(
+    prefix,
+    () => '$prefix-${DateTime.now().microsecondsSinceEpoch}',
+  );
 }
 
 Future<bool> ensureMicrophonePermission() async {

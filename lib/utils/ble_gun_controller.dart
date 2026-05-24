@@ -320,9 +320,31 @@ class BleGunController {
   static Stream<GunBatteryLevel> watchBatteryLevel({
     required String deviceId,
   }) async* {
-    yield* watchTelemetry(
-      deviceId: deviceId,
-    ).map((sample) => sample.batteryLevel).distinct();
+    DateTime? lastEmittedAt;
+    GunBatteryLevel? lastEmittedLevel;
+
+    await for (final sample in watchTelemetry(deviceId: deviceId)) {
+      final level = sample.batteryLevel;
+      final now = DateTime.now();
+
+      final shouldEmit =
+          lastEmittedAt == null ||
+          now.difference(lastEmittedAt) >= const Duration(minutes: 1);
+
+      if (!shouldEmit) {
+        continue;
+      }
+
+      // Avoid duplicate UI refresh when battery tier did not change.
+      if (level == lastEmittedLevel) {
+        lastEmittedAt = now;
+        continue;
+      }
+
+      lastEmittedAt = now;
+      lastEmittedLevel = level;
+      yield level;
+    }
   }
 
   static Stream<GunTelemetrySample> watchTelemetry({
@@ -449,6 +471,23 @@ class BleGunController {
     return device;
   }
 
+  static Future<void> disconnect({required String deviceId}) async {
+    final key = _normalizeDeviceId(deviceId);
+    final device = deviceFromId(deviceId);
+
+    _configCharacteristics.remove(key);
+    _telemetryCharacteristics.remove(key);
+    _commandCharacteristics.remove(key);
+    _configWriteLocks.remove(key);
+    _commandWriteLocks.remove(key);
+
+    if (device.isDisconnected) {
+      return;
+    }
+
+    await device.disconnect();
+  }
+
   static Future<void> setRecoilMode({
     required String deviceId,
     required bool enabled,
@@ -500,7 +539,6 @@ class BleGunController {
     required BluetoothCharacteristic characteristic,
     required List<int> data,
   }) {
-    final supportsWrite = characteristic.properties.write;
     final supportsWriteNoResponse =
         characteristic.properties.writeWithoutResponse;
     final withoutResponse = supportsWriteNoResponse;
@@ -524,7 +562,6 @@ class BleGunController {
     required BluetoothCharacteristic characteristic,
     required List<int> data,
   }) {
-    final supportsWrite = characteristic.properties.write;
     final supportsWriteNoResponse =
         characteristic.properties.writeWithoutResponse;
     final withoutResponse = supportsWriteNoResponse;
@@ -545,7 +582,6 @@ class BleGunController {
 
   static Future<void> pulseRecoil({required String deviceId}) async {
     final characteristic = await _configCharacteristicForDevice(deviceId);
-    final supportsWrite = characteristic.properties.write;
     final supportsWriteNoResponse =
         characteristic.properties.writeWithoutResponse;
     final withoutResponse = supportsWriteNoResponse;

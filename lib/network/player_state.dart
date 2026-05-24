@@ -6,6 +6,7 @@ class PlayerState {
     required this.playerClass,
     required this.score,
     required this.kills,
+    this.deaths = 0,
     required this.hitsLanded,
     required this.shotsFired,
     required this.hitsTaken,
@@ -23,6 +24,7 @@ class PlayerState {
   final String playerClass;
   final int score;
   final int kills;
+  final int deaths;
   final int hitsLanded;
   final int shotsFired;
   final int hitsTaken;
@@ -40,6 +42,7 @@ class PlayerState {
     String? playerClass,
     int? score,
     int? kills,
+    int? deaths,
     int? hitsLanded,
     int? shotsFired,
     int? hitsTaken,
@@ -57,6 +60,7 @@ class PlayerState {
       playerClass: playerClass ?? this.playerClass,
       score: score ?? this.score,
       kills: kills ?? this.kills,
+      deaths: deaths ?? this.deaths,
       hitsLanded: hitsLanded ?? this.hitsLanded,
       shotsFired: shotsFired ?? this.shotsFired,
       hitsTaken: hitsTaken ?? this.hitsTaken,

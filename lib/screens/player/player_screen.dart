@@ -157,20 +157,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  void _showGunEventSnack(String message) {
-    if (!mounted) {
-      return;
-    }
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.hideCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(milliseconds: 1200),
-      ),
-    );
-  }
-
   Future<void> _openPlayerLobbyScreen() async {
     if (!mounted) {
       return;
@@ -266,14 +252,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _playActionSound(String assetPath, {Duration? cutoff}) async {
-    await _gunSfxPlayer.stop();
     await _gunSfxPlayer.play(AssetSource(assetPath), volume: 1.0);
-    _gunSfxCutoffTimer?.cancel();
-    if (cutoff != null) {
-      _gunSfxCutoffTimer = Timer(cutoff, () {
-        unawaited(_gunSfxPlayer.stop());
-      });
-    }
   }
 
   Future<void> _playOptionalActionSound(
@@ -619,11 +598,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           if (sample.triggerCounter != _lastTriggerCounter) {
             _lastTriggerCounter = sample.triggerCounter;
-            const message = 'Trigger pressed: shoot signal received from gun.';
-            setState(() {
-              _status = message;
-            });
-            _showGunEventSnack(message);
             unawaited(_playGunShotSound());
             final profile = _savedGunProfile;
             if (_gunConnected && profile != null && profile.recoilEnabled) {
@@ -637,12 +611,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           if (sample.reloadCounter != _lastReloadCounter) {
             _lastReloadCounter = sample.reloadCounter;
-            const message =
-                'Reload button pressed: reload signal received from gun.';
-            setState(() {
-              _status = message;
-            });
-            _showGunEventSnack(message);
             unawaited(_playReloadSound());
           }
 
@@ -664,32 +632,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     : _recoilDisabledSoundAssetPath,
               ),
             );
-            _showGunEventSnack(
-              enableRecoil
-                  ? 'Power button pressed: recoil mode enabled.'
-                  : 'Power button pressed: recoil mode disabled.',
-            );
           }
 
           final hitBy1Key = (sample.hitBy1 << 3) | sample.hitBy1ShotId;
           if (sample.hitBy1 > 0 && hitBy1Key != _lastHitBy1Key) {
             _lastHitBy1Key = hitBy1Key;
-            final message = 'Hit detected from player ${sample.hitBy1}.';
-            setState(() {
-              _status = message;
-            });
-            _showGunEventSnack(message);
             unawaited(_playOptionalActionSound(_hitSoundAssetPath));
           }
 
           final hitBy2Key = (sample.hitBy2 << 3) | sample.hitBy2ShotId;
           if (sample.hitBy2 > 0 && hitBy2Key != _lastHitBy2Key) {
             _lastHitBy2Key = hitBy2Key;
-            final message = 'Hit detected from player ${sample.hitBy2}.';
-            setState(() {
-              _status = message;
-            });
-            _showGunEventSnack(message);
             unawaited(_playOptionalActionSound(_hitSoundAssetPath));
           }
         });
@@ -881,7 +834,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _status =
           'Fire mode switched to ${nextMode.label} via Thumb / Rear Button.';
     });
-    _showGunEventSnack('Fire mode switched to ${nextMode.label}.');
 
     if (_gunConnected) {
       await _applyShotModeToGun(profile: updatedProfile);
@@ -935,22 +887,66 @@ class _PlayerScreenState extends State<PlayerScreen> {
         unawaited(_playItemUseSound(effect.effectType));
       }
     });
-    _startGpsUpdates();
+    await _startGpsUpdates();
   }
 
-  void _startGpsUpdates() {
-    _gpsSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 5,
-            timeLimit: Duration(milliseconds: 1500),
-          ),
-        ).listen((position) {
+  Future<void> _startGpsUpdates() async {
+    await _gpsSub?.cancel();
+
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (mounted) {
+          setState(() {
+            _status = 'Location service is off. Player map updates disabled.';
+          });
+        }
+        return;
+      }
+
+      final permission = await Geolocator.checkPermission();
+      final hasPermission =
+          permission == LocationPermission.always ||
+          permission == LocationPermission.whileInUse;
+      if (!hasPermission) {
+        if (mounted) {
+          setState(() {
+            _status =
+                'Location permission missing. Player map updates disabled.';
+          });
+        }
+        return;
+      }
+
+      _gpsSub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 5,
+          timeLimit: Duration(milliseconds: 1500),
+        ),
+      ).listen(
+        (position) {
           unawaited(
             _service.updateGpsPosition(position.latitude, position.longitude),
           );
-        });
+        },
+        onError: (_) {
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _status = 'Could not read location updates. Continuing without GPS.';
+          });
+        },
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = 'GPS initialization failed. Continuing without location.';
+      });
+    }
   }
 
   @override

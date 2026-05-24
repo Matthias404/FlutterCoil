@@ -227,32 +227,32 @@ class _ServerScreenState extends State<ServerScreen> {
         case _GameModePreset.time:
           _matchLength = 15;
           _maxLives = 10;
-          _respawnDelaySeconds = 3;
+          _respawnDelaySeconds = 5;
           _itemSpawnRateSeconds = 60;
           _friendlyFire = false;
         case _GameModePreset.lives:
           _matchLength = 10;
           _maxLives = 3;
-          _respawnDelaySeconds = 3;
+          _respawnDelaySeconds = 5;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = false;
         case _GameModePreset.teamLives:
           _matchLength = 10;
           _maxLives = 15;
-          _respawnDelaySeconds = 3;
+          _respawnDelaySeconds = 5;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = false;
         case _GameModePreset.kingOfTheHill:
           _matchLength = 12;
           _maxLives = 0;
-          _respawnDelaySeconds = 2;
+          _respawnDelaySeconds = 4;
           _itemSpawnRateSeconds = 30;
           _hillRadiusMeters = 2.0;
           _friendlyFire = false;
         case _GameModePreset.freeForAll:
           _matchLength = 10;
           _maxLives = 8;
-          _respawnDelaySeconds = 2;
+          _respawnDelaySeconds = 4;
           _itemSpawnRateSeconds = 45;
           _friendlyFire = true;
       }
@@ -928,17 +928,48 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
   StreamSubscription<NetworkSnapshot>? _updatesSub;
   NetworkSnapshot? _snapshot;
   String _status = 'Lobby is open.';
+  Map<String, bool> _lastConnectionByPlayerId = <String, bool>{};
 
   @override
   void initState() {
     super.initState();
     _snapshot = widget.service.snapshot;
+    _lastConnectionByPlayerId = <String, bool>{
+      for (final player in (_snapshot?.players.values ?? const <PlayerState>[]))
+        player.id: player.isNetworkConnected,
+      widget.service.localPlayer.id: widget.service.localPlayer.isNetworkConnected,
+    };
     _updatesSub = widget.service.updates.listen((snapshot) {
       if (!mounted) {
         return;
       }
+
+      final playersById = <String, PlayerState>{
+        for (final player in snapshot.players.values) player.id: player,
+        widget.service.localPlayer.id: widget.service.localPlayer,
+      };
+
+      String? connectionStatusMessage;
+      final nextConnectionByPlayerId = <String, bool>{};
+      for (final entry in playersById.entries) {
+        final player = entry.value;
+        final wasConnected = _lastConnectionByPlayerId[player.id];
+        final isConnected = player.isNetworkConnected;
+        nextConnectionByPlayerId[player.id] = isConnected;
+        if (wasConnected == null || wasConnected == isConnected) {
+          continue;
+        }
+        connectionStatusMessage = isConnected
+            ? '${player.name} reconnected.'
+            : '${player.name} disconnected (grace period started).';
+      }
+
       setState(() {
         _snapshot = snapshot;
+        _lastConnectionByPlayerId = nextConnectionByPlayerId;
+        if (connectionStatusMessage != null) {
+          _status = connectionStatusMessage;
+        }
       });
     });
   }
@@ -997,7 +1028,18 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
   @override
   Widget build(BuildContext context) {
     final snapshot = _snapshot;
-    final players = snapshot?.players.values.toList() ?? const <PlayerState>[];
+    final playersById = <String, PlayerState>{
+      if (snapshot != null)
+        for (final player in snapshot.players.values) player.id: player,
+      widget.service.localPlayer.id: widget.service.localPlayer,
+    };
+    final players = playersById.values.toList()
+      ..sort((a, b) {
+        if (a.isHost != b.isHost) {
+          return a.isHost ? -1 : 1;
+        }
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
     final rules = snapshot?.lobbyRules;
     final scheduledStartAt = snapshot?.scheduledGameStartAt;
     final countdown = scheduledStartAt?.difference(DateTime.now());
@@ -1112,14 +1154,36 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
           ),
           const SizedBox(height: 8),
           ...players.map(
-            (player) => ListTile(
-              title: Text(player.name),
-              subtitle: Text(
-                'group=${player.group} gun=${player.gunConnected ? 'connected' : 'not connected'} '
-                'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} score=${player.score} kills=${player.kills} hits=${player.hitsLanded} taken=${player.hitsTaken}',
-              ),
-              trailing: player.isHost ? const Icon(Icons.shield) : null,
-            ),
+            (player) {
+              final connectionLabel = player.isNetworkConnected
+                  ? 'online'
+                  : 'offline';
+              final secondsSinceSeen = DateTime.now()
+                  .difference(player.lastSeen)
+                  .inSeconds
+                  .clamp(0, 9999);
+
+              return ListTile(
+                title: Text(player.name),
+                subtitle: Text(
+                  'group=${player.group} net=$connectionLabel '
+                  'gun=${player.gunConnected ? 'connected' : 'not connected'} '
+                  'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} '
+                  'lastSeen=${secondsSinceSeen}s '
+                  'score=${player.score} kills=${player.kills} deaths=${player.deaths} hits=${player.hitsLanded}',
+                ),
+                trailing: player.isHost
+                    ? const Icon(Icons.shield)
+                    : Icon(
+                        player.isNetworkConnected
+                            ? Icons.wifi
+                            : Icons.wifi_off,
+                        color: player.isNetworkConnected
+                            ? Colors.green
+                            : Colors.redAccent,
+                      ),
+              );
+            },
           ),
         ],
       ),

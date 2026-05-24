@@ -22,9 +22,9 @@ class PlayerResultsScreen extends StatelessWidget {
         if (scoreOrder != 0) {
           return scoreOrder;
         }
-        final hitOrder = a.hitsTaken.compareTo(b.hitsTaken);
-        if (hitOrder != 0) {
-          return hitOrder;
+        final deathOrder = a.deaths.compareTo(b.deaths);
+        if (deathOrder != 0) {
+          return deathOrder;
         }
         return a.name.toLowerCase().compareTo(b.name.toLowerCase());
       });
@@ -162,7 +162,7 @@ class PlayerResultsScreen extends StatelessWidget {
                             ],
                           ),
                           subtitle: Text(
-                            'Team ${player.group} • Kills ${player.kills} • Hits ${player.hitsLanded} • Taken ${player.hitsTaken} • Shots ${player.shotsFired}',
+                            'Team ${player.group} • Kills ${player.kills} • Deaths ${player.deaths} • Hits ${player.hitsLanded} • Shots ${player.shotsFired}',
                             style: const TextStyle(color: Colors.white70),
                           ),
                           trailing: Text(

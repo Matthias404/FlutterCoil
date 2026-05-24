@@ -386,26 +386,6 @@ class _StartScreenState extends State<StartScreen> {
                                 onPressed: () {
                                   Navigator.of(context).push(
                                     MaterialPageRoute<void>(
-                                      builder: (_) => const GameBrowserScreen(),
-                                    ),
-                                  );
-                                },
-                                icon: const Icon(Icons.list),
-                                label: const Text('Browse Available Games'),
-                              ),
-                              const SizedBox(height: 16),
-                              OutlinedButton.icon(
-                                style: OutlinedButton.styleFrom(
-                                  foregroundColor: foregroundColor,
-                                  side: BorderSide(
-                                    color: foregroundColor.withValues(
-                                      alpha: 0.45,
-                                    ),
-                                  ),
-                                ),
-                                onPressed: () {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(
                                       builder: (_) => const PlayerScreen(),
                                     ),
                                   );

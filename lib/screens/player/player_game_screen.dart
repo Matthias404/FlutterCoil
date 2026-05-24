@@ -70,9 +70,9 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   _PendingAirStrike? _pendingAirStrike;
   Timer? _killOverlayTimer;
   String? _killOverlayMessage;
+  bool _keepKillOverlayUntilRespawn = false;
   String? _lastPickupNotificationId;
   double _radarSweepDegrees = 0;
-  int _tick = 0;
   NetworkSnapshot? _snapshot;
   StreamSubscription<NetworkSnapshot>? _snapshotSub;
   StreamSubscription<KillEvent>? _killEventSub;
@@ -87,7 +87,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   int _shotSfxPlayerIndex = 0;
   String _gunShotAssetPath = MediaConfic.laserShot;
   String? _reloadSoundAssetPath;
-  String? _healSoundAssetPath;
   Timer? _gunSfxCutoffTimer;
   bool _isRecordingTeamVoice = false;
   String _teamVoiceStatus = 'Team voice ready.';
@@ -207,12 +206,23 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     await _playOptionalActionSound(sound);
   }
 
-  void _showKillOverlay(String message) {
+  void _showKillOverlay(
+    String message, {
+    bool keepUntilRespawn = false,
+    Duration duration = const Duration(seconds: 2),
+  }) {
     setState(() => _killOverlayMessage = message);
     _killOverlayTimer?.cancel();
-    _killOverlayTimer = Timer(const Duration(seconds: 2), () {
+    _keepKillOverlayUntilRespawn = keepUntilRespawn;
+    if (keepUntilRespawn) {
+      return;
+    }
+    _killOverlayTimer = Timer(duration, () {
       if (mounted) {
-        setState(() => _killOverlayMessage = null);
+        setState(() {
+          _killOverlayMessage = null;
+          _keepKillOverlayUntilRespawn = false;
+        });
       }
     });
   }
@@ -225,14 +235,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   }
 
   Future<void> _playActionSound(String assetPath, {Duration? cutoff}) async {
-    await _gunSfxPlayer.stop();
     await _gunSfxPlayer.play(AssetSource(assetPath), volume: 1.0);
-    _gunSfxCutoffTimer?.cancel();
-    if (cutoff != null) {
-      _gunSfxCutoffTimer = Timer(cutoff, () {
-        unawaited(_gunSfxPlayer.stop());
-      });
-    }
   }
 
   Future<void> _playOptionalActionSound(
@@ -383,6 +386,13 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     final local = snapshot.players[widget.service.localPlayerId];
     final rules = snapshot.lobbyRules;
     final maxLives = rules.maxLives;
+    final previousSnapshot = _snapshot;
+    final previousLocal = previousSnapshot?.players[widget.service.localPlayerId];
+    final previousWasDead =
+        previousLocal != null && previousLocal.hitsTaken >= maxLives;
+    final currentIsAlive = local != null && local.hitsTaken < maxLives;
+    final respawnedNow = previousWasDead && currentIsAlive;
+
     setState(() {
       _snapshot = snapshot;
       if (snapshot.gamePhase == GamePhase.running) {
@@ -399,6 +409,11 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       if (snapshot.gamePhase == GamePhase.ended && _isGameRunning) {
         _timeRemaining = 0;
         _isGameRunning = false;
+      }
+
+      if (respawnedNow && _keepKillOverlayUntilRespawn) {
+        _killOverlayMessage = null;
+        _keepKillOverlayUntilRespawn = false;
       }
     });
 
@@ -457,9 +472,15 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       return;
     }
     if (kill.victimPlayerId == widget.service.localPlayerId) {
-      _showKillOverlay('Killed by ${kill.killerName}');
+      _showKillOverlay(
+        'Killed by ${kill.killerName}',
+        keepUntilRespawn: true,
+      );
     } else if (kill.killerPlayerId == widget.service.localPlayerId) {
-      _showKillOverlay('You eliminated ${kill.victimName}!');
+      _showKillOverlay(
+        'You eliminated ${kill.victimName}!',
+        duration: const Duration(seconds: 4),
+      );
     }
   }
 
@@ -750,26 +771,21 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
     int shotsToFire;
     Duration spacing;
-    String modeLabel;
     switch (mode) {
       case FireMode.single:
         shotsToFire = 1;
         spacing = Duration.zero;
-        modeLabel = 'Single';
       case FireMode.burst3:
         shotsToFire = _burst3ShotsPerTriggerPress;
         spacing = _burstShotInterval;
-        modeLabel = 'Burst 3';
       case FireMode.auto:
         // SimpleCoil uses FE/01 for full-auto (continuous while held). In this
         // trigger-event test screen, a single press event maps to one auto shot.
         shotsToFire = _autoShotsPerTriggerPress;
         spacing = _autoShotInterval;
-        modeLabel = 'Auto';
     }
 
     _isFiringSequence = true;
-    var firedShots = 0;
     try {
       for (var i = 0; i < shotsToFire; i++) {
         if (!mounted || _isReloading) {
@@ -785,7 +801,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
           break;
         }
 
-        firedShots += 1;
         final profile = _savedGunProfile;
         if (profile != null && _gunConnected) {
           unawaited(BleGunController.pulseRecoil(deviceId: profile.deviceId));
@@ -1071,73 +1086,100 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   }
 
   Future<void> _initializeGpsTracking() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _gpsStatus = 'GPS: location service disabled.';
-      });
-      return;
-    }
+    await _positionSubscription?.cancel();
 
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _gpsStatus = 'GPS: location permission denied.';
-      });
-      return;
-    }
-
-    final current = await Geolocator.getCurrentPosition();
-    if (mounted) {
-      final livePosition = LatLng(current.latitude, current.longitude);
-      setState(() {
-        _gpsPlayerPosition = livePosition;
-        _gpsStatus =
-            'GPS: ${current.latitude.toStringAsFixed(5)}, ${current.longitude.toStringAsFixed(5)}';
-      });
-      _mapController.move(livePosition, 18);
-      unawaited(
-        widget.service.updateGpsPosition(current.latitude, current.longitude),
-      );
-    }
-
-    _positionSubscription =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 2,
-            timeLimit: Duration(milliseconds: 1500),
-          ),
-        ).listen((position) {
-          if (!mounted) {
-            return;
-          }
-
-          final livePosition = LatLng(position.latitude, position.longitude);
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (mounted) {
           setState(() {
-            _gpsPlayerPosition = livePosition;
-            _gpsStatus =
-                'GPS: ${position.latitude.toStringAsFixed(5)}, ${position.longitude.toStringAsFixed(5)}';
+            _gpsStatus = 'GPS: location service disabled.';
           });
-          _mapController.move(livePosition, 18);
-          unawaited(
-            widget.service.updateGpsPosition(
-              position.latitude,
-              position.longitude,
-            ),
-          );
+        }
+        return;
+      }
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        if (mounted) {
+          setState(() {
+            _gpsStatus = 'GPS: location permission denied.';
+          });
+        }
+        return;
+      }
+
+      final current = await Geolocator.getCurrentPosition();
+      if (mounted) {
+        final livePosition = LatLng(current.latitude, current.longitude);
+        setState(() {
+          _gpsPlayerPosition = livePosition;
+          _gpsStatus =
+              'GPS: ${current.latitude.toStringAsFixed(5)}, ${current.longitude.toStringAsFixed(5)}';
         });
+        try {
+          _mapController.move(livePosition, 18);
+        } catch (_) {
+          // Map may not be fully attached yet during startup.
+        }
+        unawaited(
+          widget.service.updateGpsPosition(current.latitude, current.longitude),
+        );
+      }
+
+      _positionSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 2,
+              timeLimit: Duration(milliseconds: 1500),
+            ),
+          ).listen(
+            (position) {
+              if (!mounted) {
+                return;
+              }
+
+              final livePosition = LatLng(position.latitude, position.longitude);
+              setState(() {
+                _gpsPlayerPosition = livePosition;
+                _gpsStatus =
+                    'GPS: ${position.latitude.toStringAsFixed(5)}, ${position.longitude.toStringAsFixed(5)}';
+              });
+              try {
+                _mapController.move(livePosition, 18);
+              } catch (_) {
+                // Ignore transient map-controller race during early frames.
+              }
+              unawaited(
+                widget.service.updateGpsPosition(
+                  position.latitude,
+                  position.longitude,
+                ),
+              );
+            },
+            onError: (_) {
+              if (!mounted) {
+                return;
+              }
+              setState(() {
+                _gpsStatus = 'GPS: live updates unavailable.';
+              });
+            },
+          );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _gpsStatus = 'GPS: initialization failed.';
+      });
+    }
   }
 
   void _startTimer() {
@@ -1148,7 +1190,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         return;
       }
 
-      _tick += 1;
       _radarSweepDegrees = (_radarSweepDegrees + 18) % 360;
       _tickEffectTimers();
 
@@ -1183,8 +1224,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
           _timeRemaining = 0;
           _isGameRunning = false;
         });
-        _navigateToResultsIfNeeded();
-        timer.cancel();
+        // Wait for the server to end the game and broadcast final scores.
         return;
       }
     });
@@ -1464,19 +1504,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     return result;
   }
 
-  LatLng _metersToLatLng(double xMeters, double yMeters) {
-    final playerPosition = _playerPosition();
-    final metersPerDegreeLat = 111320.0;
-    final metersPerDegreeLon =
-        111320.0 * math.cos(playerPosition.latitude * math.pi / 180);
-    final latOffset = -yMeters / metersPerDegreeLat;
-    final lonOffset = xMeters / metersPerDegreeLon;
-    return LatLng(
-      playerPosition.latitude + latOffset,
-      playerPosition.longitude + lonOffset,
-    );
-  }
-
   Color _itemCategoryColor(GameItemCategory category) {
     switch (category) {
       case GameItemCategory.healing:
@@ -1514,12 +1541,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       case GameItemCategory.special:
         return Icons.warning_amber;
     }
-  }
-
-  double _distanceMeters(double x1, double y1, double x2, double y2) {
-    final dx = x1 - x2;
-    final dy = y1 - y2;
-    return math.sqrt(dx * dx + dy * dy);
   }
 
   List<CircleMarker> _buildItemPickupCircles() {
@@ -1650,40 +1671,24 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
       return const SizedBox.shrink();
     }
     return Positioned(
-      bottom: 120,
-      left: 24,
-      right: 24,
+      top: 132,
+      left: 16,
+      right: 16,
       child: IgnorePointer(
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.88),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.redAccent, width: 2),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: <Widget>[
-                const Icon(
-                  Icons.local_fire_department,
-                  color: Colors.redAccent,
-                  size: 28,
-                ),
-                const SizedBox(width: 12),
-                Flexible(
-                  child: Text(
-                    message,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w800,
-                      fontSize: 18,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+        child: Text(
+          message,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w800,
+            fontSize: 16,
+            shadows: <Shadow>[
+              Shadow(
+                color: Colors.black,
+                blurRadius: 10,
+                offset: Offset(0, 1),
+              ),
+            ],
           ),
         ),
       ),
@@ -1858,16 +1863,12 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     final localTeam = widget.service.localPlayer.group;
     final teamPalette = teamPaletteFor(localTeam);
     final teamColors = teamBackgroundColors(localTeam, brightness: brightness);
-    final panelBg = teamPalette.secondary.withValues(
-      alpha: brightness == Brightness.dark ? 0.2 : 0.28,
-    );
     final panelBgStrong = teamPalette.primary.withValues(
       alpha: brightness == Brightness.dark ? 0.38 : 0.22,
     );
     final panelBorder = teamPalette.primary.withValues(
       alpha: brightness == Brightness.dark ? 0.45 : 0.28,
     );
-    final panelTextColor = teamPalette.foreground(brightness);
     final overlaySearchButtonStyle = OutlinedButton.styleFrom(
       foregroundColor: Colors.white,
       side: const BorderSide(color: Colors.white70),

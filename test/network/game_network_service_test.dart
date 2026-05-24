@@ -48,6 +48,7 @@ void main() {
 
       await alpha.start();
       await bravo.start();
+      await alpha.setLobbyOpen(true);
     });
 
     tearDown(() async {
@@ -70,7 +71,7 @@ void main() {
       expect(bravo.snapshot.players.containsKey('bravo'), isTrue);
     });
 
-    test('records hit and score over simulated network', () async {
+    test('records non-lethal hit without awarding kill score', () async {
       await alpha.connect();
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
@@ -81,8 +82,45 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 30));
 
       expect(alpha.localPlayer.shotsFired, 1);
-      expect(alpha.localPlayer.score, 1);
+      expect(alpha.localPlayer.score, 0);
+      expect(alpha.localPlayer.kills, 0);
       expect(bravo.localPlayer.hitsTaken, 1);
+      expect(bravo.localPlayer.deaths, 0);
+    });
+
+    test('awards kill score only when target reaches zero health', () async {
+      await alpha.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      await alpha.updateLobbyRules(
+        const LobbyRules(
+          gameType: GameType.time,
+          magazineSize: 15,
+          reloadTimeSeconds: 2,
+          maxLives: 2,
+          matchLengthMinutes: 10,
+          maxPlayers: 6,
+          respawnDelaySeconds: 5,
+          itemSpawnRateSeconds: 30,
+          friendlyFire: false,
+          allowMidGameJoin: true,
+          teamLeadVoiceOnly: true,
+        ),
+      );
+
+      await alpha.queueGameStart(delay: const Duration(milliseconds: 20));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await alpha.sendShot('bravo');
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(alpha.localPlayer.score, 0);
+      expect(alpha.localPlayer.kills, 0);
+
+      await alpha.sendShot('bravo');
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(alpha.localPlayer.score, 1);
+      expect(alpha.localPlayer.kills, 1);
+      expect(bravo.localPlayer.deaths, 1);
     });
 
     test('syncs lobby rules from server to player', () async {
@@ -112,6 +150,69 @@ void main() {
       expect(bravo.snapshot.lobbyRules.matchLengthMinutes, 12);
       expect(bravo.snapshot.lobbyRules.friendlyFire, isTrue);
       expect(bravo.snapshot.lobbyRules.teamLeadVoiceOnly, isTrue);
+    });
+
+    test('auto ends match when timer expires', () async {
+      await alpha.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      await alpha.updateLobbyRules(
+        const LobbyRules(
+          gameType: GameType.time,
+          magazineSize: 15,
+          reloadTimeSeconds: 2,
+          maxLives: 10,
+          matchLengthMinutes: 0,
+          maxPlayers: 6,
+          respawnDelaySeconds: 3,
+          itemSpawnRateSeconds: 30,
+          friendlyFire: false,
+          allowMidGameJoin: true,
+          teamLeadVoiceOnly: true,
+        ),
+      );
+
+      await alpha.queueGameStart(delay: const Duration(milliseconds: 20));
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      expect(alpha.snapshot.gamePhase, GamePhase.ended);
+      expect(bravo.snapshot.gamePhase, GamePhase.ended);
+    });
+
+    test('keeps score when game is ended by server', () async {
+      await alpha.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      await alpha.updateLobbyRules(
+        const LobbyRules(
+          gameType: GameType.time,
+          magazineSize: 15,
+          reloadTimeSeconds: 2,
+          maxLives: 1,
+          matchLengthMinutes: 10,
+          maxPlayers: 6,
+          respawnDelaySeconds: 5,
+          itemSpawnRateSeconds: 30,
+          friendlyFire: false,
+          allowMidGameJoin: true,
+          teamLeadVoiceOnly: true,
+        ),
+      );
+
+      await alpha.queueGameStart(delay: const Duration(milliseconds: 20));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await alpha.sendShot('bravo');
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      expect(alpha.localPlayer.score, 1);
+
+      await alpha.endGame();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(alpha.snapshot.gamePhase, GamePhase.ended);
+      expect(alpha.localPlayer.score, 1);
+      expect(bravo.snapshot.gamePhase, GamePhase.ended);
     });
   });
 }

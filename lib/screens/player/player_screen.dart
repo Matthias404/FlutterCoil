@@ -164,10 +164,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PlayerLobbyScreen(
-          service: _service,
-          initialTeam: _selectedTeam,
-        ),
+        builder: (_) =>
+            PlayerLobbyScreen(service: _service, initialTeam: _selectedTeam),
       ),
     );
   }
@@ -185,8 +183,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final isLobbyOpen = _snapshot?.lobbyOpen ?? false;
       if (!isLobbyOpen) {
         setState(() {
-          _status =
-              'Lobby is closed. Wait for the server to click Open Lobby.';
+          _status = 'Game is closed. Wait for the server to click Open Game.';
         });
         return;
       }
@@ -197,8 +194,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!_showJoinCodeFallback) {
       setState(() {
         _showJoinCodeFallback = true;
-        _status =
-            'Paste a lobby join code, then tap Enter Lobby to connect.';
+        _status = 'Paste a game join code, then tap Join Game to connect.';
       });
       return;
     }
@@ -213,7 +209,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!isLobbyOpen) {
       setState(() {
         _status =
-            'Connected, but lobby is closed. Wait for server to open lobby.';
+            'Connected, but game is closed. Wait for server to open game.';
       });
       return;
     }
@@ -327,9 +323,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     final initialPlayerName = widget.initialPlayerName?.trim();
     final resolvedInitialPlayerName =
-      (initialPlayerName != null && initialPlayerName.isNotEmpty)
-      ? initialPlayerName
-      : 'Player';
+        (initialPlayerName != null && initialPlayerName.isNotEmpty)
+        ? initialPlayerName
+        : 'Player';
 
     // Use initial values from widget if provided
     if (widget.initialTeam != null && _teams.contains(widget.initialTeam)) {
@@ -412,7 +408,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _selectedTeam = savedTeam;
     });
 
-    await _service.updateLocalProfile(group: savedTeam, gunConnected: _gunConnected);
+    await _service.updateLocalProfile(
+      group: savedTeam,
+      gunConnected: _gunConnected,
+    );
   }
 
   Future<void> _saveSelectedTeam(String team) async {
@@ -452,7 +451,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _savedGunProfile = null;
         _gunConnected = false;
         _showGunDisconnectedAlert = false;
-        _status = 'Could not load saved gun profile. Open Gun Settings to pair.';
+        _status =
+            'Could not load saved gun profile. Open Gun Settings to pair.';
       });
     }
   }
@@ -496,8 +496,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     // A selected game opens its own join flow; do not open lobby from here.
   }
-
-
 
   Future<void> _startGunConnectionMonitoring(GunProfile profile) async {
     await _gunConnectionSub?.cancel();
@@ -929,27 +927,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
 
-      _gpsSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 5,
-          timeLimit: Duration(milliseconds: 1500),
-        ),
-      ).listen(
-        (position) {
-          unawaited(
-            _service.updateGpsPosition(position.latitude, position.longitude),
+      _gpsSub =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 5,
+              timeLimit: Duration(milliseconds: 1500),
+            ),
+          ).listen(
+            (position) {
+              unawaited(
+                _service.updateGpsPosition(
+                  position.latitude,
+                  position.longitude,
+                ),
+              );
+            },
+            onError: (_) {
+              if (!mounted) {
+                return;
+              }
+              setState(() {
+                _status =
+                    'Could not read location updates. Continuing without GPS.';
+              });
+            },
           );
-        },
-        onError: (_) {
-          if (!mounted) {
-            return;
-          }
-          setState(() {
-            _status = 'Could not read location updates. Continuing without GPS.';
-          });
-        },
-      );
     } catch (_) {
       if (!mounted) {
         return;
@@ -1875,7 +1878,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                             unawaited(_handleEnterLobbyTap());
                                           },
                                           icon: const Icon(Icons.login),
-                                          label: const Text('Enter Lobby'),
+                                          label: const Text('Join Game'),
                                         ),
                                       ),
                                     ],
@@ -1925,7 +1928,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     ),
                                     decoration: BoxDecoration(
                                       color: textPanelBg,
-                                      border: Border.all(color: textPanelBorder),
+                                      border: Border.all(
+                                        color: textPanelBorder,
+                                      ),
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                     child: Column(
@@ -1958,7 +1963,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                         SizedBox(
                                           width: double.infinity,
                                           child: FilledButton.icon(
-                                            style: teamSecondaryFilledButtonStyle,
+                                            style:
+                                                teamSecondaryFilledButtonStyle,
                                             onPressed: () {
                                               Navigator.of(context).push(
                                                 MaterialPageRoute<void>(
@@ -1966,16 +1972,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                                       LobbyRulesHelpScreen(
                                                         rules:
                                                             snapshot
-                                                                    ?.lobbyRules ??
-                                                            const LobbyRules
-                                                                .defaults(),
+                                                                ?.lobbyRules ??
+                                                            const LobbyRules.defaults(),
                                                       ),
                                                 ),
                                               );
                                             },
                                             icon: const Icon(Icons.info),
                                             label: const Text(
-                                                'View Full Rules Explanation'),
+                                              'View Full Rules Explanation',
+                                            ),
                                           ),
                                         ),
                                       ],
@@ -1989,7 +1995,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     ),
                                     decoration: BoxDecoration(
                                       color: textPanelBg,
-                                      border: Border.all(color: textPanelBorder),
+                                      border: Border.all(
+                                        color: textPanelBorder,
+                                      ),
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                     child: Column(
@@ -2005,35 +2013,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                           ),
                                         ),
                                         const SizedBox(height: 6),
-                                        ...ItemRegistry.definitions.values
-                                            .map(
-                                              (item) => Padding(
-                                                padding:
-                                                    const EdgeInsets.only(
-                                                      bottom: 6,
-                                                    ),
-                                                child: Row(
-                                                  children: <Widget>[
-                                                    Icon(
-                                                      Icons.inventory_2,
-                                                      size: 14,
+                                        ...ItemRegistry.definitions.values.map(
+                                          (item) => Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 6,
+                                            ),
+                                            child: Row(
+                                              children: <Widget>[
+                                                Icon(
+                                                  Icons.inventory_2,
+                                                  size: 14,
+                                                  color:
+                                                      panelSecondaryTextColor,
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Expanded(
+                                                  child: Text(
+                                                    item.name,
+                                                    style: TextStyle(
                                                       color:
                                                           panelSecondaryTextColor,
                                                     ),
-                                                    const SizedBox(width: 6),
-                                                    Expanded(
-                                                      child: Text(
-                                                        item.name,
-                                                        style: TextStyle(
-                                                          color:
-                                                              panelSecondaryTextColor,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
+                                                  ),
                                                 ),
-                                              ),
+                                              ],
                                             ),
+                                          ),
+                                        ),
                                       ],
                                     ),
                                   ),
@@ -2050,13 +2056,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                             }
                                           : null,
                                       icon: const Icon(Icons.login),
-                                      label: const Text('Enter Lobby'),
+                                      label: const Text('Join Game'),
                                     ),
                                   ),
                                   if (!isServerLobbyOpen) ...<Widget>[
                                     const SizedBox(height: 6),
                                     Text(
-                                      'Lobby is currently closed. Wait for server to click Open Lobby.',
+                                      'Game is currently closed. Wait for server to click Open Game.',
                                       style: TextStyle(
                                         color: panelSecondaryTextColor,
                                         fontSize: 11,
@@ -2066,152 +2072,196 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 ],
                                 if (_showAdvancedPlayerPanels) ...<Widget>[
                                   const SizedBox(height: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 10,
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: textPanelBg,
+                                      border: Border.all(
+                                        color: textPanelBorder,
+                                      ),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Row(
+                                      children: <Widget>[
+                                        Expanded(
+                                          child: Text(
+                                            'Game Type: ${(snapshot?.lobbyRules.gameType ?? GameType.time).label}',
+                                            style: TextStyle(
+                                              color: panelTextColor,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
+                                        IconButton(
+                                          tooltip: 'Game rules',
+                                          onPressed: () {
+                                            Navigator.of(context).push(
+                                              MaterialPageRoute<void>(
+                                                builder: (_) =>
+                                                    LobbyRulesHelpScreen(
+                                                      rules:
+                                                          snapshot
+                                                              ?.lobbyRules ??
+                                                          const LobbyRules.defaults(),
+                                                    ),
+                                              ),
+                                            );
+                                          },
+                                          icon: const Icon(Icons.help_outline),
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                  decoration: BoxDecoration(
-                                    color: textPanelBg,
-                                    border: Border.all(color: textPanelBorder),
-                                    borderRadius: BorderRadius.circular(10),
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: textPanelBg,
+                                      border: Border.all(
+                                        color: textPanelBorder,
+                                      ),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      activeEffectsLabel,
+                                      style: TextStyle(color: panelTextColor),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
                                   ),
-                                  child: Row(
-                                    children: <Widget>[
-                                      Expanded(
-                                        child: Text(
-                                          'Game Type: ${(snapshot?.lobbyRules.gameType ?? GameType.time).label}',
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: textPanelBg,
+                                      border: Border.all(
+                                        color: textPanelBorder,
+                                      ),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: <Widget>[
+                                        Text(
+                                          'Player: $localPlayerName',
                                           style: TextStyle(
                                             color: panelTextColor,
                                             fontWeight: FontWeight.w600,
                                           ),
                                         ),
-                                      ),
-                                      IconButton(
-                                        tooltip: 'Game rules',
-                                        onPressed: () {
-                                          Navigator.of(context).push(
-                                            MaterialPageRoute<void>(
-                                              builder: (_) => LobbyRulesHelpScreen(
-                                                rules:
-                                                    snapshot?.lobbyRules ??
-                                                    const LobbyRules.defaults(),
-                                              ),
-                                            ),
-                                          );
-                                        },
-                                        icon: const Icon(Icons.help_outline),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 10,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: textPanelBg,
-                                    border: Border.all(color: textPanelBorder),
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    activeEffectsLabel,
-                                    style: TextStyle(color: panelTextColor),
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 10,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: textPanelBg,
-                                    border: Border.all(color: textPanelBorder),
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: <Widget>[
-                                      Text(
-                                        'Player: $localPlayerName',
-                                        style: TextStyle(
-                                          color: panelTextColor,
-                                          fontWeight: FontWeight.w600,
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          hasJoinedLobby
+                                              ? (countdownStarted
+                                                    ? 'Lobby countdown active. Team changes are locked.'
+                                                    : 'Lobby connected. You can still change your team.')
+                                              : 'Enter name and connect to a lobby.',
+                                          style: TextStyle(
+                                            color: panelSecondaryTextColor,
+                                          ),
                                         ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  DropdownButtonFormField<String>(
+                                    initialValue: _selectedTeam,
+                                    isDense: compact,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Team',
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    items: _teams
+                                        .map(
+                                          (team) => DropdownMenuItem<String>(
+                                            value: team,
+                                            child: Row(
+                                              children: <Widget>[
+                                                _teamIcon(team),
+                                                const SizedBox(width: 8),
+                                                Text(team),
+                                              ],
+                                            ),
+                                          ),
+                                        )
+                                        .toList(),
+                                    onChanged: canChangeTeam
+                                        ? (team) {
+                                            if (team != null) {
+                                              unawaited(
+                                                _handleTeamSelectionChanged(
+                                                  team,
+                                                  hasJoinedLobby:
+                                                      hasJoinedLobby,
+                                                ),
+                                              );
+                                            }
+                                          }
+                                        : null,
+                                  ),
+                                  const SizedBox(height: 8),
+                                  if (_showJoinCodeFallback) ...<Widget>[
+                                    TextField(
+                                      controller: _joinCodeController,
+                                      decoration: InputDecoration(
+                                        isDense: compact,
+                                        labelText: 'Lobby join code',
+                                        helperText: compact
+                                            ? null
+                                            : 'Paste the code shown on the host device.',
+                                        border: const OutlineInputBorder(),
                                       ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        hasJoinedLobby
-                                            ? (countdownStarted
-                                                  ? 'Lobby countdown active. Team changes are locked.'
-                                                  : 'Lobby connected. You can still change your team.')
-                                            : 'Enter name and connect to a lobby.',
+                                      maxLines: 1,
+                                      onChanged: (_) {
+                                        setState(() {});
+                                      },
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 8,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: textPanelBg,
+                                        border: Border.all(
+                                          color: textPanelBorder,
+                                        ),
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Text(
+                                        networkHint,
                                         style: TextStyle(
                                           color: panelSecondaryTextColor,
                                         ),
+                                        maxLines: compact ? 2 : 3,
+                                        overflow: TextOverflow.ellipsis,
                                       ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                DropdownButtonFormField<String>(
-                                  initialValue: _selectedTeam,
-                                  isDense: compact,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Team',
-                                    border: OutlineInputBorder(),
-                                  ),
-                                  items: _teams
-                                      .map(
-                                        (team) => DropdownMenuItem<String>(
-                                          value: team,
-                                          child: Row(
-                                            children: <Widget>[
-                                              _teamIcon(team),
-                                              const SizedBox(width: 8),
-                                              Text(team),
-                                            ],
-                                          ),
-                                        ),
-                                      )
-                                      .toList(),
-                                  onChanged: canChangeTeam
-                                      ? (team) {
-                                          if (team != null) {
-                                            unawaited(
-                                              _handleTeamSelectionChanged(
-                                                team,
-                                                hasJoinedLobby: hasJoinedLobby,
-                                              ),
-                                            );
-                                          }
-                                        }
-                                      : null,
-                                ),
-                                const SizedBox(height: 8),
-                                if (_showJoinCodeFallback) ...<Widget>[
-                                  TextField(
-                                    controller: _joinCodeController,
-                                    decoration: InputDecoration(
-                                      isDense: compact,
-                                      labelText: 'Lobby join code',
-                                      helperText: compact
-                                          ? null
-                                          : 'Paste the code shown on the host device.',
-                                      border: const OutlineInputBorder(),
                                     ),
-                                    maxLines: 1,
-                                    onChanged: (_) {
-                                      setState(() {});
-                                    },
-                                  ),
-                                  const SizedBox(height: 6),
+                                    const SizedBox(height: 8),
+                                    FilledButton.icon(
+                                      style: teamSecondaryFilledButtonStyle,
+                                      onPressed: hasPlayerName
+                                          ? () {
+                                              unawaited(_handleEnterLobbyTap());
+                                            }
+                                          : null,
+                                      icon: const Icon(Icons.login),
+                                      label: const Text('Join Game'),
+                                    ),
+                                    const SizedBox(height: 8),
+                                  ],
+                                  const SizedBox(height: 4),
                                   Container(
                                     padding: const EdgeInsets.symmetric(
                                       horizontal: 10,
@@ -2225,63 +2275,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                     child: Text(
-                                      networkHint,
+                                      _voiceStatus,
                                       style: TextStyle(
                                         color: panelSecondaryTextColor,
                                       ),
-                                      maxLines: compact ? 2 : 3,
+                                      maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
                                     ),
                                   ),
                                   const SizedBox(height: 8),
-                                  FilledButton.icon(
-                                    style: teamSecondaryFilledButtonStyle,
-                                    onPressed: hasPlayerName
-                                        ? () {
-                                            unawaited(_handleEnterLobbyTap());
-                                          }
-                                        : null,
-                                    icon: const Icon(Icons.login),
-                                    label: const Text('Enter Lobby'),
-                                  ),
-                                  const SizedBox(height: 8),
-                                ],
-                                OutlinedButton.icon(
-                                  style: teamOutlinedButtonStyle,
-                                  onPressed: _toggleTeamVoice,
-                                  icon: Icon(
-                                    _isRecordingVoice
-                                        ? Icons.stop_circle_outlined
-                                        : Icons.mic,
-                                  ),
-                                  label: Text(
-                                    _isRecordingVoice
-                                        ? 'Stop And Send Voice To Lobby'
-                                        : 'Record Voice For Lobby',
-                                  ),
-                                ),
-                                const SizedBox(height: 4),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 8,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: textPanelBg,
-                                    border: Border.all(color: textPanelBorder),
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    _voiceStatus,
-                                    style: TextStyle(
-                                      color: panelSecondaryTextColor,
-                                    ),
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                infoPanels,
+                                  infoPanels,
                                 ],
                               ],
                             ),
@@ -2289,6 +2292,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         );
                       },
                     ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            left: 12,
+            top: 0,
+            bottom: 0,
+            child: SafeArea(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: FloatingActionButton.small(
+                  heroTag: 'team_voice_fab',
+                  tooltip: _isRecordingVoice
+                      ? 'Stop and send team voice'
+                      : 'Record team voice',
+                  backgroundColor: _isRecordingVoice
+                      ? Colors.redAccent
+                      : Colors.blueGrey.shade800,
+                  foregroundColor: Colors.white,
+                  onPressed: _toggleTeamVoice,
+                  child: Icon(
+                    _isRecordingVoice
+                        ? Icons.stop_circle_outlined
+                        : Icons.chat_bubble_outline,
                   ),
                 ),
               ),

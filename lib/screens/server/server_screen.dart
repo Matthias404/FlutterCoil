@@ -42,6 +42,7 @@ class _ServerScreenState extends State<ServerScreen> {
   double _magazineSize = 15;
   double _reloadTimeSeconds = 2;
   double _matchLength = 10;
+  double _preGameCountdownSeconds = 20;
   double _respawnDelaySeconds = 3;
   double _itemSpawnRateSeconds = _itemSpawnMinSeconds;
   double _hillRadiusMeters = 2.0;
@@ -148,6 +149,8 @@ class _ServerScreenState extends State<ServerScreen> {
           _magazineSize = snapshot.lobbyRules.magazineSize.toDouble();
           _reloadTimeSeconds = snapshot.lobbyRules.reloadTimeSeconds.toDouble();
           _matchLength = snapshot.lobbyRules.matchLengthMinutes.toDouble();
+          _preGameCountdownSeconds = snapshot.lobbyRules.preGameCountdownSeconds
+              .toDouble();
           _respawnDelaySeconds = snapshot.lobbyRules.respawnDelaySeconds
               .toDouble();
           _itemSpawnRateSeconds = _normalizeItemSpawnRate(
@@ -285,6 +288,10 @@ class _ServerScreenState extends State<ServerScreen> {
     final magazineSize = _magazineSize.round();
     final reloadTimeSeconds = _reloadTimeSeconds.round();
     final matchLength = _matchLength.round();
+    final preGameCountdownSeconds = _preGameCountdownSeconds.round().clamp(
+      10,
+      120,
+    );
     final respawnDelaySeconds = _respawnDelaySeconds.round();
     final itemSpawnRateSeconds = _itemSpawnDisabled
         ? _itemSpawnDisabledSeconds.round()
@@ -315,6 +322,7 @@ class _ServerScreenState extends State<ServerScreen> {
         allowMidGameJoin: allowMidGameJoin,
         teamLeadVoiceOnly: teamLeadVoiceOnly,
         showOtherPlayersOnMap: showOtherPlayersOnMap,
+        preGameCountdownSeconds: preGameCountdownSeconds,
       ),
     );
     if (!mounted) {
@@ -756,6 +764,21 @@ class _ServerScreenState extends State<ServerScreen> {
                     },
                   ),
                   Text(
+                    'Pre-game countdown: ${_preGameCountdownSeconds.round()} seconds',
+                  ),
+                  Slider(
+                    value: _preGameCountdownSeconds,
+                    min: 10,
+                    max: 120,
+                    divisions: 110,
+                    label: _preGameCountdownSeconds.round().toString(),
+                    onChanged: (value) {
+                      setState(() {
+                        _preGameCountdownSeconds = value;
+                      });
+                    },
+                  ),
+                  Text(
                     'Respawn delay: ${_respawnDelaySeconds.round()} seconds',
                   ),
                   Slider(
@@ -892,7 +915,7 @@ class _ServerScreenState extends State<ServerScreen> {
                       FilledButton.icon(
                         onPressed: _openLobby,
                         icon: const Icon(Icons.door_front_door),
-                        label: const Text('Open Lobby'),
+                        label: const Text('Open Game'),
                       ),
                     ],
                   ),
@@ -937,7 +960,8 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
     _lastConnectionByPlayerId = <String, bool>{
       for (final player in (_snapshot?.players.values ?? const <PlayerState>[]))
         player.id: player.isNetworkConnected,
-      widget.service.localPlayer.id: widget.service.localPlayer.isNetworkConnected,
+      widget.service.localPlayer.id:
+          widget.service.localPlayer.isNetworkConnected,
     };
     _updatesSub = widget.service.updates.listen((snapshot) {
       if (!mounted) {
@@ -987,14 +1011,20 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
     return '$minutes:$seconds';
   }
 
-  Future<void> _startIn60Seconds() async {
+  Future<void> _startWithConfiguredCountdown() async {
+    final configuredSeconds = widget
+        .service
+        .snapshot
+        .lobbyRules
+        .preGameCountdownSeconds
+        .clamp(10, 120);
     await widget.service.queueGameStart();
     if (!mounted) {
       return;
     }
     setState(() {
       _status =
-          'Game start queued. Match starts in 60s or when all Team Leads are ready.';
+          'Game start queued. Match starts in ${configuredSeconds}s or when all Team Leads are ready.';
     });
   }
 
@@ -1087,8 +1117,8 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
             runSpacing: 12,
             children: <Widget>[
               FilledButton(
-                onPressed: _startIn60Seconds,
-                child: const Text('Start In 60s'),
+                onPressed: _startWithConfiguredCountdown,
+                child: const Text('Start Match'),
               ),
               OutlinedButton(
                 onPressed: _endGame,
@@ -1121,6 +1151,9 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
                     Text('Reload time: ${rules.reloadTimeSeconds}s'),
                     Text('Max lives: ${rules.maxLives}'),
                     Text('Match length: ${rules.matchLengthMinutes}m'),
+                    Text(
+                      'Pre-game countdown: ${rules.preGameCountdownSeconds}s',
+                    ),
                     Text('Respawn delay: ${rules.respawnDelaySeconds}s'),
                     Text('Respawn mode: ${_respawnLabel(rules.respawnMode)}'),
                     Text(
@@ -1153,38 +1186,34 @@ class _ServerLobbyOverviewScreenState extends State<ServerLobbyOverviewScreen> {
             style: Theme.of(context).textTheme.titleMedium,
           ),
           const SizedBox(height: 8),
-          ...players.map(
-            (player) {
-              final connectionLabel = player.isNetworkConnected
-                  ? 'online'
-                  : 'offline';
-              final secondsSinceSeen = DateTime.now()
-                  .difference(player.lastSeen)
-                  .inSeconds
-                  .clamp(0, 9999);
+          ...players.map((player) {
+            final connectionLabel = player.isNetworkConnected
+                ? 'online'
+                : 'offline';
+            final secondsSinceSeen = DateTime.now()
+                .difference(player.lastSeen)
+                .inSeconds
+                .clamp(0, 9999);
 
-              return ListTile(
-                title: Text(player.name),
-                subtitle: Text(
-                  'group=${player.group} net=$connectionLabel '
-                  'gun=${player.gunConnected ? 'connected' : 'not connected'} '
-                  'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} '
-                  'lastSeen=${secondsSinceSeen}s '
-                  'score=${player.score} kills=${player.kills} deaths=${player.deaths} hits=${player.hitsLanded}',
-                ),
-                trailing: player.isHost
-                    ? const Icon(Icons.shield)
-                    : Icon(
-                        player.isNetworkConnected
-                            ? Icons.wifi
-                            : Icons.wifi_off,
-                        color: player.isNetworkConnected
-                            ? Colors.green
-                            : Colors.redAccent,
-                      ),
-              );
-            },
-          ),
+            return ListTile(
+              title: Text(player.name),
+              subtitle: Text(
+                'group=${player.group} net=$connectionLabel '
+                'gun=${player.gunConnected ? 'connected' : 'not connected'} '
+                'role=${player.playerClass == 'Team Lead' ? 'Team Lead' : 'Assult'} '
+                'lastSeen=${secondsSinceSeen}s '
+                'score=${player.score} kills=${player.kills} deaths=${player.deaths} hits=${player.hitsLanded}',
+              ),
+              trailing: player.isHost
+                  ? const Icon(Icons.shield)
+                  : Icon(
+                      player.isNetworkConnected ? Icons.wifi : Icons.wifi_off,
+                      color: player.isNetworkConnected
+                          ? Colors.green
+                          : Colors.redAccent,
+                    ),
+            );
+          }),
         ],
       ),
     );

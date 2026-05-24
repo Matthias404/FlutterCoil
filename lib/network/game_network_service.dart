@@ -121,25 +121,27 @@ class LobbyRules {
     this.allowMidGameJoin = true,
     this.teamLeadVoiceOnly = false,
     this.showOtherPlayersOnMap = true,
+    this.preGameCountdownSeconds = 20,
   });
 
   const LobbyRules.defaults()
-      : gameType = GameType.time,
-        firingEnvironment = FiringEnvironment.outdoor,
-        magazineSize = 15,
-        reloadTimeSeconds = 2,
-        maxLives = 10,
-        matchLengthMinutes = 10,
-        maxPlayers = 20,
-        respawnDelaySeconds = 5,
-        itemSpawnRateSeconds = 30,
-        respawnMode = RespawnMode.onDeath,
-        baseRadiusMeters = 2.0,
-        hillRadiusMeters = 2.0,
-        friendlyFire = false,
-        allowMidGameJoin = true,
-        teamLeadVoiceOnly = false,
-        showOtherPlayersOnMap = true;
+    : gameType = GameType.time,
+      firingEnvironment = FiringEnvironment.outdoor,
+      magazineSize = 15,
+      reloadTimeSeconds = 2,
+      maxLives = 10,
+      matchLengthMinutes = 10,
+      maxPlayers = 20,
+      respawnDelaySeconds = 5,
+      itemSpawnRateSeconds = 30,
+      respawnMode = RespawnMode.onDeath,
+      baseRadiusMeters = 2.0,
+      hillRadiusMeters = 2.0,
+      friendlyFire = false,
+      allowMidGameJoin = true,
+      teamLeadVoiceOnly = false,
+      showOtherPlayersOnMap = true,
+      preGameCountdownSeconds = 20;
 
   final GameType gameType;
   final FiringEnvironment firingEnvironment;
@@ -157,6 +159,7 @@ class LobbyRules {
   final bool allowMidGameJoin;
   final bool teamLeadVoiceOnly;
   final bool showOtherPlayersOnMap;
+  final int preGameCountdownSeconds;
 
   LobbyRules copyWith({
     GameType? gameType,
@@ -175,6 +178,7 @@ class LobbyRules {
     bool? allowMidGameJoin,
     bool? teamLeadVoiceOnly,
     bool? showOtherPlayersOnMap,
+    int? preGameCountdownSeconds,
   }) {
     return LobbyRules(
       gameType: gameType ?? this.gameType,
@@ -194,6 +198,8 @@ class LobbyRules {
       teamLeadVoiceOnly: teamLeadVoiceOnly ?? this.teamLeadVoiceOnly,
       showOtherPlayersOnMap:
           showOtherPlayersOnMap ?? this.showOtherPlayersOnMap,
+      preGameCountdownSeconds:
+          preGameCountdownSeconds ?? this.preGameCountdownSeconds,
     );
   }
 
@@ -215,6 +221,7 @@ class LobbyRules {
       'allowMidGameJoin': allowMidGameJoin,
       'teamLeadVoiceOnly': teamLeadVoiceOnly,
       'showOtherPlayersOnMap': showOtherPlayersOnMap,
+      'preGameCountdownSeconds': preGameCountdownSeconds,
     };
   }
 
@@ -240,6 +247,8 @@ class LobbyRules {
       allowMidGameJoin: json['allowMidGameJoin'] as bool? ?? true,
       teamLeadVoiceOnly: json['teamLeadVoiceOnly'] as bool? ?? true,
       showOtherPlayersOnMap: json['showOtherPlayersOnMap'] as bool? ?? true,
+      preGameCountdownSeconds: ((json['preGameCountdownSeconds'] as int?) ?? 20)
+          .clamp(10, 120),
     );
   }
 }
@@ -365,10 +374,10 @@ class GameNetworkService {
       <String, _PreservedPlayerStats>{};
   final Map<String, int> _staleConnectionChecksByPlayerId = <String, int>{};
   final Map<String, String> _endpointKeyByPlayerId = <String, String>{};
-    final Map<String, _PendingReliableSend> _pendingReliableSendsByKey =
+  final Map<String, _PendingReliableSend> _pendingReliableSendsByKey =
       <String, _PendingReliableSend>{};
-    final Map<String, DateTime> _processedHitEventIds = <String, DateTime>{};
-    final Map<String, DateTime> _processedShotEventIds = <String, DateTime>{};
+  final Map<String, DateTime> _processedHitEventIds = <String, DateTime>{};
+  final Map<String, DateTime> _processedShotEventIds = <String, DateTime>{};
   StreamSubscription<DatagramEnvelope>? _sub;
   Timer? _scheduledStartTriggerTimer;
   Timer? _scheduledStartTimer;
@@ -397,6 +406,7 @@ class GameNetworkService {
   static const Duration _shotEventDedupTtl = Duration(seconds: 8);
   static const Duration _pickupNotificationTtl = Duration(seconds: 5);
   static const double _itemPickupRadiusMeters = 1.5;
+  static const int _maxConcurrentItems = 2;
   LobbyRules _lobbyRules = const LobbyRules.defaults();
   GamePhase _gamePhase = GamePhase.setup;
   bool _lobbyOpen = false;
@@ -408,18 +418,18 @@ class GameNetworkService {
   int? _lastAppliedStateSequence;
   final Map<String, String> _lastBroadcastPlayerSignatureById =
       <String, String>{};
-    final Map<String, String> _lastBroadcastItemSignatureById =
+  final Map<String, String> _lastBroadcastItemSignatureById =
       <String, String>{};
-    final Map<String, String> _lastBroadcastEffectSignatureById =
+  final Map<String, String> _lastBroadcastEffectSignatureById =
       <String, String>{};
-      final Map<String, String> _lastBroadcastPickupSignatureById =
-        <String, String>{};
+  final Map<String, String> _lastBroadcastPickupSignatureById =
+      <String, String>{};
   Duration _serverClockOffset = Duration.zero;
   Set<String> _readyTeamLeadIds = <String>{};
   DateTime? _lastGpsBroadcast;
   double? _lastBroadcastLatitude;
   double? _lastBroadcastLongitude;
-  DateTime? _lastItemSpawnAt;
+  final List<DateTime> _scheduledItemSpawnTimes = <DateTime>[];
 
   Stream<NetworkSnapshot> get updates => _updates.stream;
   Stream<TeamVoiceMessage> get teamVoiceMessages => _teamVoiceMessages.stream;
@@ -621,7 +631,8 @@ class GameNetworkService {
         'playerClass': player.playerClass,
         'gunConnected': player.gunConnected,
         'isHost': player.isHost,
-        if (_localRecoilPlayerId != null) 'recoilPlayerId': _localRecoilPlayerId,
+        if (_localRecoilPlayerId != null)
+          'recoilPlayerId': _localRecoilPlayerId,
         if (player.latitude != null) 'latitude': player.latitude,
         if (player.longitude != null) 'longitude': player.longitude,
       },
@@ -748,9 +759,7 @@ class GameNetworkService {
     await queueGameStart();
   }
 
-  Future<void> queueGameStart({
-    Duration delay = const Duration(seconds: 20),
-  }) async {
+  Future<void> queueGameStart({Duration? delay}) async {
     if (!isServer) {
       return;
     }
@@ -764,9 +773,13 @@ class GameNetworkService {
     _assignRoundRoles();
     _readyTeamLeadIds = <String>{};
     _gameStartedAt = null;
-    _scheduledGameStartAt = DateTime.now().toUtc().add(delay);
+    final configuredDelay = Duration(
+      seconds: _lobbyRules.preGameCountdownSeconds.clamp(10, 120),
+    );
+    final effectiveDelay = delay ?? configuredDelay;
+    _scheduledGameStartAt = DateTime.now().toUtc().add(effectiveDelay);
 
-    _scheduledStartTriggerTimer = Timer(delay, () {
+    _scheduledStartTriggerTimer = Timer(effectiveDelay, () {
       unawaited(_startGameNow());
     });
 
@@ -835,7 +848,8 @@ class GameNetworkService {
     _items.clear();
     _activeEffects.clear();
     _recentItemPickups.clear();
-    _lastItemSpawnAt = null;
+    _scheduledItemSpawnTimes.clear();
+    _scheduleInitialItemSpawns();
 
     _gamePhase = GamePhase.running;
 
@@ -872,7 +886,7 @@ class GameNetworkService {
     _items.clear();
     _activeEffects.clear();
     _recentItemPickups.clear();
-    _lastItemSpawnAt = null;
+    _scheduledItemSpawnTimes.clear();
 
     _gamePhase = GamePhase.ended;
     _emit();
@@ -1203,7 +1217,7 @@ class GameNetworkService {
       return <String>{};
     }
     return _players.values
-      .where((player) => !player.isHost)
+        .where((player) => !player.isHost)
         .where((player) => player.playerClass == 'Team Lead')
         .map((player) => player.id)
         .toSet();
@@ -1382,10 +1396,7 @@ class GameNetworkService {
       type: PacketType.ack,
       playerId: localPlayerId,
       playerName: _players[localPlayerId]?.name,
-      payload: <String, dynamic>{
-        'ackId': reliableId,
-        'ackType': reliableType,
-      },
+      payload: <String, dynamic>{'ackId': reliableId, 'ackType': reliableType},
     );
     unawaited(_safeSend(host: host, port: port, packet: ack));
   }
@@ -1460,6 +1471,15 @@ class GameNetworkService {
         false;
     final isHost =
         packet.payload['isHost'] as bool? ?? existing?.isHost ?? false;
+    final shouldLockServerAssignedRole =
+        isServer &&
+        !forceFreeForAll &&
+        !isHost &&
+        existing != null &&
+        (_scheduledGameStartAt != null || _gamePhase == GamePhase.running);
+    final resolvedPlayerClass = shouldLockServerAssignedRole
+        ? existing.playerClass
+        : playerClass;
     final latitude =
         (packet.payload['latitude'] as num?)?.toDouble() ?? existing?.latitude;
     final longitude =
@@ -1497,7 +1517,7 @@ class GameNetworkService {
         id: id,
         name: packet.playerName ?? id,
         group: group,
-        playerClass: playerClass,
+        playerClass: resolvedPlayerClass,
         score: preservedStats?.score ?? 0,
         kills: preservedStats?.kills ?? 0,
         deaths: preservedStats?.deaths ?? 0,
@@ -1516,7 +1536,7 @@ class GameNetworkService {
     _players[id] = existing.copyWith(
       name: packet.playerName ?? existing.name,
       group: group,
-      playerClass: playerClass,
+      playerClass: resolvedPlayerClass,
       gunConnected: gunConnected,
       isHost: isHost,
       lastSeen: DateTime.now(),
@@ -1632,9 +1652,9 @@ class GameNetworkService {
     final stateSequence = ++_nextStateSequence;
     final syncPlayers = _players.values;
     final fullWorldSync =
-      reliableCritical || _lastBroadcastItemSignatureById.isEmpty;
+        reliableCritical || _lastBroadcastItemSignatureById.isEmpty;
     final fullEffectSync =
-      reliableCritical || _lastBroadcastEffectSignatureById.isEmpty;
+        reliableCritical || _lastBroadcastEffectSignatureById.isEmpty;
     final fullPickupSync =
         reliableCritical || _lastBroadcastPickupSignatureById.isEmpty;
 
@@ -1671,7 +1691,8 @@ class GameNetworkService {
     for (final item in _items) {
       final signature = _itemSyncSignature(item);
       currentItemSignatures[item.id] = signature;
-      if (fullWorldSync || _lastBroadcastItemSignatureById[item.id] != signature) {
+      if (fullWorldSync ||
+          _lastBroadcastItemSignatureById[item.id] != signature) {
         final serialized = item.toJson();
         if (fullWorldSync) {
           fullItems.add(serialized);
@@ -1865,22 +1886,70 @@ class GameNetworkService {
       return;
     }
 
-    if (_lobbyRules.itemSpawnRateSeconds > 0) {
-      final now = DateTime.now();
-      final lastSpawnAt = _lastItemSpawnAt;
-      if (lastSpawnAt == null ||
-          now.difference(lastSpawnAt).inSeconds >=
-              _lobbyRules.itemSpawnRateSeconds) {
-        if (_spawnServerOwnedItem()) {
-          _lastItemSpawnAt = now;
-        }
-      }
-    }
+    _processScheduledItemSpawns();
 
     _checkForItemPickups();
   }
 
+  void _scheduleInitialItemSpawns() {
+    if (_lobbyRules.itemSpawnRateSeconds <= 0) {
+      _scheduledItemSpawnTimes.clear();
+      return;
+    }
+
+    final now = DateTime.now();
+    _scheduledItemSpawnTimes
+      ..clear()
+      ..add(now);
+    if (_maxConcurrentItems > 1) {
+      _scheduledItemSpawnTimes.add(
+        now.add(Duration(seconds: _lobbyRules.itemSpawnRateSeconds)),
+      );
+    }
+  }
+
+  void _scheduleReplacementItemSpawn(DateTime fromTime) {
+    if (_lobbyRules.itemSpawnRateSeconds <= 0) {
+      return;
+    }
+
+    _scheduledItemSpawnTimes.add(
+      fromTime.add(Duration(seconds: _lobbyRules.itemSpawnRateSeconds)),
+    );
+  }
+
+  void _processScheduledItemSpawns() {
+    if (_lobbyRules.itemSpawnRateSeconds <= 0 ||
+        _scheduledItemSpawnTimes.isEmpty) {
+      return;
+    }
+
+    _scheduledItemSpawnTimes.sort();
+    final now = DateTime.now();
+    var index = 0;
+    while (index < _scheduledItemSpawnTimes.length &&
+        _items.length < _maxConcurrentItems) {
+      final scheduledAt = _scheduledItemSpawnTimes[index];
+      if (scheduledAt.isAfter(now)) {
+        break;
+      }
+
+      if (_spawnServerOwnedItem()) {
+        _scheduledItemSpawnTimes.removeAt(index);
+        continue;
+      }
+
+      // Retry soon if no valid spawn anchor exists yet.
+      _scheduledItemSpawnTimes[index] = now.add(_itemTickInterval);
+      index += 1;
+    }
+  }
+
   bool _spawnServerOwnedItem() {
+    if (_items.length >= _maxConcurrentItems) {
+      return false;
+    }
+
     final positionedPlayers = _players.values
         .where((player) => player.id != localPlayerId)
         .where((player) => player.latitude != null && player.longitude != null)
@@ -1958,6 +2027,7 @@ class GameNetworkService {
 
       changed = true;
       _applyItemEffectToGame(item, collector);
+      _scheduleReplacementItemSpawn(DateTime.now());
     }
 
     if (!changed) {
@@ -2239,7 +2309,9 @@ class GameNetworkService {
               .whereType<String>()
               .toSet();
       if (removedEffectIds.isNotEmpty) {
-        _activeEffects.removeWhere((effect) => removedEffectIds.contains(effect.id));
+        _activeEffects.removeWhere(
+          (effect) => removedEffectIds.contains(effect.id),
+        );
       }
     }
 
@@ -2564,6 +2636,7 @@ class GameNetworkService {
     _disconnectionGracePeriodTimers.clear();
     _staleConnectionChecksByPlayerId.clear();
     _endpointKeyByPlayerId.clear();
+    _scheduledItemSpawnTimes.clear();
     await _sub?.cancel();
     await transport.stop();
     await _teamVoiceMessages.close();

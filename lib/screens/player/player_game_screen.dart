@@ -762,6 +762,7 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
   }
 
   Future<void> _startTelemetryMonitoring(GunProfile profile) async {
+    final firstSampleCompleter = Completer<void>();
     await _gunTelemetrySub?.cancel();
     _lastTriggerCounter = null;
     _lastReloadCounter = null;
@@ -774,6 +775,26 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         BleGunController.watchTelemetry(deviceId: profile.deviceId).listen(
           (sample) {
             if (!mounted) {
+              return;
+            }
+
+            if (!firstSampleCompleter.isCompleted) {
+              _lastTriggerCounter = sample.triggerCounter;
+              _lastReloadCounter = sample.reloadCounter;
+              _lastStartCounter = sample.thumbCounter;
+              _lastRecoilPlayerIdReported = sample.recoilPlayerId > 0
+                  ? sample.recoilPlayerId
+                  : null;
+              _lastHitBy1Key = (sample.hitBy1 << 3) | sample.hitBy1ShotId;
+              _lastHitBy2Key = (sample.hitBy2 << 3) | sample.hitBy2ShotId;
+              _isTriggerHeld =
+                  (sample.buttons & _recoilTriggerButtonBit) != 0;
+              if (sample.batteryLevel != _gunBatteryLevel) {
+                setState(() {
+                  _gunBatteryLevel = sample.batteryLevel;
+                });
+              }
+              firstSampleCompleter.complete();
               return;
             }
 
@@ -844,6 +865,13 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
             _scheduleAutoReconnect();
           },
         );
+
+    await firstSampleCompleter.future.timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {
+        throw TimeoutException('Timed out waiting for fresh gun telemetry.');
+      },
+    );
   }
 
   void _startAutoFireLoop() {
@@ -1253,6 +1281,12 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
     await _positionSubscription?.cancel();
 
     try {
+      if (mounted) {
+        setState(() {
+          _gpsStatus = 'GPS: checking location services...';
+        });
+      }
+
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         if (mounted) {
@@ -1265,6 +1299,11 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
 
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
+        if (mounted) {
+          setState(() {
+            _gpsStatus = 'GPS: requesting location permission...';
+          });
+        }
         permission = await Geolocator.requestPermission();
       }
 
@@ -1278,7 +1317,18 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
         return;
       }
 
-      final current = await Geolocator.getCurrentPosition();
+      if (mounted) {
+        setState(() {
+          _gpsStatus = 'GPS: permission granted, waiting for fix...';
+        });
+      }
+
+      final current = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 10),
+        ),
+      );
       if (mounted) {
         final livePosition = LatLng(current.latitude, current.longitude);
         setState(() {
@@ -1301,7 +1351,6 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
             locationSettings: const LocationSettings(
               accuracy: LocationAccuracy.high,
               distanceFilter: 2,
-              timeLimit: Duration(milliseconds: 1500),
             ),
           ).listen(
             (position) {
@@ -1339,6 +1388,13 @@ class _PlayerGameScreenState extends State<PlayerGameScreen> {
               });
             },
           );
+    } on TimeoutException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _gpsStatus = 'GPS: waiting for a fix timed out.';
+      });
     } catch (_) {
       if (!mounted) {
         return;

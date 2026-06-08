@@ -396,7 +396,7 @@ class BleGunController {
     await characteristic.setNotifyValue(true);
     _log('watchTelemetry notify true device=$key');
 
-    yield* characteristic.lastValueStream
+    yield* characteristic.onValueReceived
         .where((value) => value.length > _recoilTelemetryStatusOffset)
         .map(_parseTelemetrySample);
   }

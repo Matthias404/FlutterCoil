@@ -459,14 +459,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _searchLanAndHandleFallback() async {
     final name = _nameController.text.trim();
-    if (name.isEmpty) {
-      setState(() {
-        _status = 'Enter your player name before searching for games.';
-      });
-      return;
+    if (name.isNotEmpty) {
+      await _savePlayerName(name);
     }
-
-    await _savePlayerName(name);
     if (!mounted) {
       return;
     }
@@ -932,7 +927,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
             locationSettings: const LocationSettings(
               accuracy: LocationAccuracy.high,
               distanceFilter: 5,
-              timeLimit: Duration(milliseconds: 1500),
             ),
           ).listen(
             (position) {

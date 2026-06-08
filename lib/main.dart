@@ -148,7 +148,6 @@ class _AppBootstrapGateState extends State<_AppBootstrapGate> {
       permissions.addAll(<Permission>[
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
-        Permission.nearbyWifiDevices,
         Permission.locationWhenInUse,
       ]);
     } else if (Platform.isIOS) {
@@ -163,7 +162,24 @@ class _AppBootstrapGateState extends State<_AppBootstrapGate> {
       ]);
     }
 
-    await permissions.request();
+    final statuses = await permissions.request();
+    if (!mounted) {
+      return;
+    }
+
+    final denied = <String>[];
+    for (final entry in statuses.entries) {
+      if (entry.value.isGranted) {
+        continue;
+      }
+      denied.add(entry.key.toString().split('.').last);
+    }
+
+    if (denied.isNotEmpty) {
+      setState(() {
+        _status = 'Permissions needed: ${denied.join(', ')}.';
+      });
+    }
   }
 
   Future<LatLng> _resolveMapCenter() async {
@@ -432,123 +448,156 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
   bool _isSearching = false;
   String? _permissionHint;
   String? _permissionStatusDetails;
+  String? _scanError;
 
   @override
   void initState() {
     super.initState();
-
-    (_checkLanPermissionStatus());
-    _searchForGames();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_bootstrapBrowser());
+    });
   }
 
-  Future<void> _searchForGames() async {
-    setState(() {
-      _isSearching = true;
-      _discoveredGames = <AdvertisedGame>[];
-      _permissionHint = null;
-    });
-
-    final hasLanPermissions = await _ensureAndroidLanPermissions();
-    if (!hasLanPermissions) {
+  Future<void> _bootstrapBrowser() async {
+    try {
+      await _checkLanPermissionStatus();
+      if (!mounted) {
+        return;
+      }
+      await _searchForGames();
+    } catch (_) {
       if (!mounted) {
         return;
       }
       setState(() {
         _isSearching = false;
+        _scanError =
+            'Game search could not start on this device. You can retry or use a join code.';
       });
-      return;
     }
+  }
 
-    final discoveredByHost = <String, AdvertisedGame>{};
-    RawDatagramSocket? socket;
-
+  Future<void> _searchForGames() async {
     try {
-      socket = await RawDatagramSocket.bind(
-        InternetAddress.anyIPv4,
-        0,
-        reuseAddress: true,
-        reusePort: true,
-      );
-      socket.broadcastEnabled = true;
+      setState(() {
+        _isSearching = true;
+        _discoveredGames = <AdvertisedGame>[];
+        _permissionHint = null;
+        _scanError = null;
+      });
 
-      socket.listen((event) {
-        if (event != RawSocketEvent.read) {
+      final hasLanPermissions = await _ensureAndroidLanPermissions();
+      if (!hasLanPermissions) {
+        if (!mounted) {
           return;
         }
-        final datagram = socket?.receive();
-        if (datagram == null) {
-          return;
-        }
+        setState(() {
+          _isSearching = false;
+        });
+        return;
+      }
 
-        try {
-          final packet = NetworkPacket.decode(utf8.decode(datagram.data));
-          if (!_isServerAdvertisement(packet)) {
+      final discoveredByHost = <String, AdvertisedGame>{};
+      RawDatagramSocket? socket;
+
+      try {
+        socket = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4,
+          0,
+          reuseAddress: true,
+        );
+        socket.broadcastEnabled = true;
+
+        socket.listen((event) {
+          if (event != RawSocketEvent.read) {
+            return;
+          }
+          final datagram = socket?.receive();
+          if (datagram == null) {
             return;
           }
 
-          final host = datagram.address.address;
-          final statePlayers =
-              (packet.payload['players'] as List?) ?? const <dynamic>[];
-          final stateRules = (packet.payload['rules'] as Map?)
-              ?.cast<String, dynamic>();
+          try {
+            final packet = NetworkPacket.decode(utf8.decode(datagram.data));
+            if (!_isServerAdvertisement(packet)) {
+              return;
+            }
 
-          final playerCount = statePlayers.length;
-          final maxPlayers = stateRules?['maxPlayers'] as int? ?? 6;
-          final serverName = packet.playerName?.trim().isNotEmpty == true
-              ? packet.playerName!.trim()
-              : 'LAN Server';
+            final host = datagram.address.address;
+            final statePlayers =
+                (packet.payload['players'] as List?) ?? const <dynamic>[];
+            final stateRules = (packet.payload['rules'] as Map?)
+                ?.cast<String, dynamic>();
 
-          discoveredByHost[host] = AdvertisedGame(
-            name: serverName,
-            host: host,
-            port: datagram.port,
-            playerCount: playerCount,
-            maxPlayers: maxPlayers,
-          );
-        } catch (_) {
-          // Ignore non-protocol traffic.
+            final playerCount = statePlayers.length;
+            final maxPlayers = stateRules?['maxPlayers'] as int? ?? 6;
+            final serverName = packet.playerName?.trim().isNotEmpty == true
+                ? packet.playerName!.trim()
+                : 'LAN Server';
+
+            discoveredByHost[host] = AdvertisedGame(
+              name: serverName,
+              host: host,
+              port: datagram.port,
+              playerCount: playerCount,
+              maxPlayers: maxPlayers,
+            );
+          } catch (_) {
+            // Ignore non-protocol traffic.
+          }
+        });
+
+        final probe = NetworkPacket(
+          type: PacketType.hello,
+          playerId: 'browse-${DateTime.now().microsecondsSinceEpoch}',
+          playerName: 'LAN Browser',
+          payload: const <String, dynamic>{
+            'browserProbe': true,
+            'group': 'Browser',
+            'playerClass': 'Assult',
+            'gunConnected': false,
+            'isHost': false,
+          },
+        );
+        final payload = utf8.encode(probe.encode());
+
+        final probeTargets = <InternetAddress>{
+          ...await _broadcastTargets(),
+        };
+
+        for (final target in probeTargets) {
+          socket.send(payload, target, _defaultServerPort);
         }
-      });
 
-      final probe = NetworkPacket(
-        type: PacketType.hello,
-        playerId: 'browse-${DateTime.now().microsecondsSinceEpoch}',
-        playerName: 'LAN Browser',
-        payload: const <String, dynamic>{
-          'browserProbe': true,
-          'group': 'Browser',
-          'playerClass': 'Assult',
-          'gunConnected': false,
-          'isHost': false,
-        },
-      );
-      final payload = utf8.encode(probe.encode());
-
-      final probeTargets = <InternetAddress>{
-        ...await _broadcastTargets(),
-        ...await _subnetProbeTargets(),
-      };
-
-      for (final target in probeTargets) {
-        socket.send(payload, target, _defaultServerPort);
+        await Future<void>.delayed(const Duration(seconds: 2));
+      } catch (_) {
+        // Keep UX graceful; list remains empty and user can retry/manual join.
+      } finally {
+        socket?.close();
       }
 
-      await Future<void>.delayed(const Duration(seconds: 2));
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _discoveredGames = discoveredByHost.values.toList()
+          ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        _isSearching = false;
+      });
     } catch (_) {
-      // Keep UX graceful; list remains empty and user can retry/manual join.
-    } finally {
-      socket?.close();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isSearching = false;
+        _scanError =
+            'Game search failed unexpectedly. Retry the scan or use a join code.';
+      });
     }
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _discoveredGames = discoveredByHost.values.toList()
-        ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-      _isSearching = false;
-    });
   }
 
   Future<bool> _ensureAndroidLanPermissions() async {
@@ -557,10 +606,21 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
     }
 
     final blockingPermissions = <Permission>[Permission.locationWhenInUse];
-    final optionalPermissions = <Permission>[Permission.nearbyWifiDevices];
 
-    final statusMap = await blockingPermissions.request();
-    final optionalStatusMap = await optionalPermissions.request();
+    Map<Permission, PermissionStatus> statusMap;
+    try {
+      statusMap = await blockingPermissions.request();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _permissionHint =
+              'Unable to request LAN permissions on this device. You can retry or use manual join.';
+        });
+      }
+      await _checkLanPermissionStatus();
+      return false;
+    }
+
     final deniedPermissions = <String>[];
     for (final entry in statusMap.entries) {
       if (!entry.value.isGranted) {
@@ -568,14 +628,6 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
           deniedPermissions.add('Location');
         }
       }
-    }
-
-    final nearbyWifiStatus = optionalStatusMap[Permission.nearbyWifiDevices];
-    if (nearbyWifiStatus != null && !nearbyWifiStatus.isGranted && mounted) {
-      setState(() {
-        _permissionHint =
-            'Nearby Wi-Fi permission is denied on this phone. LAN scan will still try using location + UDP fallback.';
-      });
     }
 
     if (deniedPermissions.isEmpty) {
@@ -606,9 +658,22 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
       return;
     }
 
-    final locationServiceEnabled = await Geolocator.isLocationServiceEnabled();
-    final locationStatus = await Permission.locationWhenInUse.status;
-    final nearbyWifiStatus = await Permission.nearbyWifiDevices.status;
+    bool locationServiceEnabled = false;
+    PermissionStatus locationStatus = PermissionStatus.denied;
+
+    try {
+      locationServiceEnabled = await Geolocator.isLocationServiceEnabled();
+      locationStatus = await Permission.locationWhenInUse.status;
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _permissionStatusDetails =
+            'Phone checks unavailable on this device. LAN discovery can still retry.';
+      });
+      return;
+    }
 
     if (!mounted) {
       return;
@@ -633,8 +698,7 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
     setState(() {
       _permissionStatusDetails =
           'Phone checks: Location service ${locationServiceEnabled ? 'ON' : 'OFF'}, '
-          'Location permission ${statusLabel(locationStatus)}, '
-          'Nearby Wi-Fi permission ${statusLabel(nearbyWifiStatus)}.';
+          'Location permission ${statusLabel(locationStatus)}.';
     });
   }
 
@@ -662,41 +726,6 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
       }
     } catch (_) {
       // Ignore and keep global broadcast fallback.
-    }
-    return targets.toList();
-  }
-
-  Future<List<InternetAddress>> _subnetProbeTargets() async {
-    final targets = <InternetAddress>{};
-    try {
-      final interfaces = await NetworkInterface.list();
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (address.type != InternetAddressType.IPv4) {
-            continue;
-          }
-          if (address.address.startsWith('127.') ||
-              address.address.startsWith('169.254')) {
-            continue;
-          }
-
-          final octets = address.address.split('.');
-          if (octets.length != 4) {
-            continue;
-          }
-
-          final prefix = '${octets[0]}.${octets[1]}.${octets[2]}';
-          final ownLast = int.tryParse(octets[3]) ?? -1;
-          for (var host = 1; host <= 254; host++) {
-            if (host == ownLast) {
-              continue;
-            }
-            targets.add(InternetAddress('$prefix.$host'));
-          }
-        }
-      }
-    } catch (_) {
-      // Ignore and use broadcast-only discovery.
     }
     return targets.toList();
   }
@@ -797,6 +826,19 @@ class _GameBrowserScreenState extends State<GameBrowserScreen> {
                       onPressed: openAppSettings,
                       icon: const Icon(Icons.settings),
                       label: const Text('Open App Settings'),
+                    ),
+                  ],
+                  if (_scanError != null) ...<Widget>[
+                    const SizedBox(height: 10),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      child: Text(
+                        _scanError!,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
                     ),
                   ],
                   if (widget.allowManualCodeFallback) ...<Widget>[
